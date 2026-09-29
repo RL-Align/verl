@@ -12,12 +12,37 @@
 # limitations under the License.
 
 import logging
+import os
 
 import torch
 
 from verl.protocol import DataProto
 
 logger = logging.getLogger(__file__)
+
+
+def _with_bitwise_audit(data: DataProto, metrics: dict) -> dict:
+    if os.environ.get("VERL_LOGP_BITWISE_AUDIT") != "1":
+        return metrics
+
+    from verl.utils.skip.skip_manager import SkipManager
+
+    step = SkipManager.step
+    if step < 1:
+        raise ValueError("bitwise logp audit requires an active training step")
+    audit = calculate_bitwise_logp_metrics(data)
+    metrics.update(audit)
+    if audit_dir := os.environ.get("VERL_LOGP_AUDIT_DIR"):
+        import json
+        from pathlib import Path
+
+        path = Path(audit_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        with (path / "mismatch.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"step": step, **audit}) + "\n")
+        keys = ("rollout_log_probs", "old_log_probs", "response_mask", "responses")
+        torch.save({key: data.batch[key].cpu() for key in keys}, path / f"logp_step{step}.pt")
+    return metrics
 
 
 def calculate_token_list_diff(tensor1: torch.Tensor, tensor2: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -102,20 +127,41 @@ def calculate_debug_metrics(data: DataProto) -> dict:
     # check if there are any valid tokens before computing metrics
     if not response_mask_bool.any():
         logger.warning("response_mask is all False, returning default metrics")
-        return {
+        return _with_bitwise_audit(data, {
             "training/rollout_probs_diff_valid": 0,
             "training/rollout_probs_diff_max": float("nan"),
             "training/rollout_probs_diff_mean": float("nan"),
             "training/rollout_probs_diff_std": float("nan"),
             "training/rollout_actor_probs_pearson_corr": float("nan"),
-        }
+        })
 
     pearson_corrcoef = pearson_correlation_coefficient(actor_probs, rollout_probs, response_mask_bool)
     rollout_probs_diff = calculate_log_prob_diff(actor_probs, rollout_probs, response_mask_bool)
-    return {
+    return _with_bitwise_audit(data, {
         "training/rollout_probs_diff_valid": 1,
         "training/rollout_probs_diff_max": torch.max(rollout_probs_diff).detach().item(),
         "training/rollout_probs_diff_mean": torch.mean(rollout_probs_diff).detach().item(),
         "training/rollout_probs_diff_std": torch.std(rollout_probs_diff).detach().item(),
         "training/rollout_actor_probs_pearson_corr": pearson_corrcoef,
+    })
+
+
+def calculate_bitwise_logp_metrics(data: DataProto) -> dict[str, int | float]:
+    """Compare only active rollout/training logp values, including signed zero."""
+    rollout = data.batch["rollout_log_probs"]
+    training = data.batch["old_log_probs"]
+    mask = data.batch["response_mask"].bool()
+    if rollout.shape != training.shape or rollout.shape != mask.shape:
+        raise ValueError("bitwise logp audit requires identical rollout, training and mask shapes")
+    if rollout.dtype != torch.float32 or training.dtype != torch.float32:
+        raise ValueError("bitwise logp audit requires float32 rollout and training logps")
+    rollout = rollout[mask].contiguous()
+    training = training[mask].contiguous()
+    if not rollout.numel() or not torch.isfinite(rollout).all() or not torch.isfinite(training).all():
+        raise ValueError("bitwise logp audit requires nonempty finite active logps")
+    mismatched = (rollout.view(torch.int32) != training.view(torch.int32)).sum()
+    return {
+        "training/rollout_logp_compared": rollout.numel(),
+        "training/rollout_logp_mismatch_count": mismatched.item(),
+        "training/rollout_logp_max_abs_diff": (rollout - training).abs().max().item(),
     }
