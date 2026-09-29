@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from typing import Optional
 
 import torch
@@ -356,6 +357,8 @@ def gptmodel_forward_model_engine(
         if router_padding_mask is not None:
             model_kwargs["padding_mask"] = router_padding_mask
 
+        if os.environ.get("VERL_RL_KERNEL") == "1":
+            model_kwargs["fp32_output"] = False
         output_orig = model(
             input_ids=input_ids_rmpad,
             attention_mask=attention_mask,

@@ -558,6 +558,8 @@ def preprocess_thd_engine(
         cu_seqlens_kv_padded=cu_seqlens_padded,
         **extra_packed_args,
     )
+    if pre_process and os.environ.get("VERL_RL_KERNEL") == "1":
+        packed_seq_params._rlk_true_lengths = tuple(seqlens_in_batch_cpu)
     if pre_process:
         return input_ids_rmpad.unsqueeze(0), packed_seq_params, position_ids_rmpad.unsqueeze(0)
     else:

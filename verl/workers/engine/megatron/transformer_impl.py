@@ -578,7 +578,18 @@ class MegatronEngine(BaseEngine):
         self._build_tf_config()
         _check_dcp_unsupported_features(self.engine_config, self.model_config, tf_config=self.tf_config)
 
+        from .rl_kernel import install as install_rl_kernel
+
+        install_rl_kernel(self.engine_config)
+
         self.module = self._build_megatron_module()
+        from .rl_kernel import capture_lm_head_input, enabled as rl_kernel_enabled
+
+        if rl_kernel_enabled():
+            for chunk in self.module:
+                layer = getattr(unwrap_model(chunk), "output_layer", None)
+                if layer is not None:
+                    capture_lm_head_input(layer)
 
         if self._qat_enabled and not self.engine_config.forward_only:
             from verl.utils.modelopt import apply_qat_to_modules
@@ -1201,11 +1212,32 @@ class MegatronEngineWithLMHead(MegatronEngine):
         logits_processor_func: Callable,
         batch: TensorDict,
         data_format: str,
+        output_layer=None,
+        cp_layout: str = "single",
     ):
         assert logits.shape[:2] == label.shape[:2]
         # avoid non-positive temperature such as padding
         temperature[temperature <= 0] = 1e-8
         assert torch.all(temperature > 0).item(), f"temperature tensor must be positive. Got {temperature}"
+        from .rl_kernel import compute_logp as rl_kernel_compute_logp
+        from .rl_kernel import enabled as rl_kernel_enabled
+
+        if rl_kernel_enabled():
+            if output_layer is None or calculate_sum_pi_squared or distillation_use_topk or distillation_only:
+                raise RuntimeError("RL-Kernel strict logp does not support this LM-head configuration")
+            log_probs, entropy = rl_kernel_compute_logp(
+                output_layer,
+                logits,
+                label,
+                temperature,
+                real_vocab_size=self.model_config.hf_config.vocab_size,
+                cp_layout=cp_layout,
+                with_entropy=calculate_entropy,
+            )
+            ret = {"log_probs": log_probs}
+            if calculate_entropy:
+                ret["entropy"] = entropy
+            return ret
         logits.div_(temperature.unsqueeze(dim=-1).to(logits.dtype))
         ret = {}
         # sum_pi_squared is non-destructive — must run before vocab_parallel_entropy.
@@ -1372,6 +1404,8 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 logits_processor_func=logits_processor_func,
                 batch=batch,
                 data_format=data_format,
+                output_layer=getattr(unwrapped_model, "output_layer", None),
+                cp_layout="single" if self.engine_config.context_parallel_size == 1 else cp_layout,
             )
 
             response_attention_mask = None
