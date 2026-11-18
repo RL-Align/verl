@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Observe fixed-sequence and fresh-generation parity on the live trainer workers."""
+
 import asyncio
 import json
 import time
@@ -8,6 +9,7 @@ from uuid import uuid4
 
 import torch
 
+from .cluster_contract import worker_key
 from .trainer_contract import strict_response_parity
 
 
@@ -16,10 +18,7 @@ def audit_version(trainer):
     version = trainer.checkpoint_manager.version
     server = trainer.llm_server_manager.server_handles[0]
     started = time.perf_counter()
-    prompts = [
-        trainer.tokenizer.encode(p, add_special_tokens=True)
-        for p in trainer.config.rlk.audit_prompts
-    ]
+    prompts = [trainer.tokenizer.encode(p, add_special_tokens=True) for p in trainer.config.rlk.audit_prompts]
     if len(prompts) != 3 or len({len(p) for p in prompts}) != 3:
         raise ValueError("audit requires three different prompt lengths")
 
@@ -113,14 +112,10 @@ def audit_version(trainer):
             label = f"{group}-{ordinal:02d}-" + "".join(order)
             actor_reply = actor_score(selected, len(selected))
             actor = actor_reply["scores"]
-            rollout = __import__("ray").get(
-                server.rlk_score_sequences.remote(selected, f"v{version}-{label}")
-            )
+            rollout = __import__("ray").get(server.rlk_score_sequences.remote(selected, f"v{version}-{label}"))
             if rollout["global_steps"] != trainer.global_steps:
                 raise RuntimeError("audit rollout score metadata is stale")
-            for i, (name, left, values) in enumerate(
-                zip(order, actor, rollout["scores"], strict=True)
-            ):
+            for i, (name, left, values) in enumerate(zip(order, actor, rollout["scores"], strict=True)):
                 right = torch.tensor(values, dtype=torch.float32)
                 extra = dict(
                     case=by_id[name],
@@ -133,18 +128,11 @@ def audit_version(trainer):
                 if name not in baseline:
                     baseline[name] = (left.clone(), right.clone())
                 else:
-                    observe(
-                        label + "-" + name + "-actor-invariance", left, baseline[name][0], extra
-                    )
-                    observe(
-                        label + "-" + name + "-rollout-invariance", right, baseline[name][1], extra
-                    )
+                    observe(label + "-" + name + "-actor-invariance", left, baseline[name][0], extra)
+                    observe(label + "-" + name + "-rollout-invariance", right, baseline[name][1], extra)
                 if group == "fresh" and ordinal < 3:
                     output = outputs["ABC".index(name)]
-                    if (
-                        output.log_probs is None
-                        or output.extra_fields.get("global_steps") != trainer.global_steps
-                    ):
+                    if output.log_probs is None or output.extra_fields.get("global_steps") != trainer.global_steps:
                         raise RuntimeError("fresh generation lacks current raw logprobs")
                     observe(
                         label + "-" + name + "-decode",
@@ -183,9 +171,7 @@ def capture_failed_audit(trainer, label, case, selected, error):
     try:
         for suffix, cases in (("single", [case]), ("batch", selected)):
             trace_label = f"failure-v{version}-{label}-{suffix}"
-            actors = trainer.actor_rollout_wg.rlk_score_sequences(
-                cases, version, len(cases), trace_label
-            )
+            actors = trainer.actor_rollout_wg.rlk_score_sequences(cases, version, len(cases), trace_label)
             rollout = ray.get(server.rlk_score_sequences.remote(cases, trace_label))
             torch.save(dict(actor=actors, rollout=rollout, cases=cases), root / f"{trace_label}.pt")
         failure["diagnostics_completed"] = True
@@ -212,7 +198,7 @@ def stress_current_version(trainer, repeats):
     server = trainer.llm_server_manager.server_handles[0]
     audit = json.loads((root / "post-update-v3.json").read_text())
     sync = json.loads((root / "sync-v3.json").read_text())
-    pids = {a["pipeline_stage"]: a["pid"] for a in sync["stages"]}
+    pids = {a["pipeline_stage"]: worker_key(a) for a in sync["stages"]}
     groups = dict(fixed=trainer._rlk_fixed_cases, fresh=audit["fresh_sequences"])
     baselines = {}
     for group, cases in groups.items():
@@ -240,7 +226,7 @@ def stress_current_version(trainer, repeats):
                 or len(reply["scores"]) != len(selected)
                 or reply["global_steps"] != 3
                 or any(
-                    stage["weight_version"] != 3 or stage["pid"] != pids[stage["pipeline_stage"]]
+                    stage["weight_version"] != 3 or worker_key(stage) != pids[stage["pipeline_stage"]]
                     for stage in reply["stages"]
                 )
             ):
@@ -283,9 +269,7 @@ def stress_current_version(trainer, repeats):
     path = root / "policy-v3-stress-readback.pt"
     exports = trainer.actor_rollout_wg.rlk_export_policy(str(path))
     (root / "stress-v3-actor-readback.json").write_text(json.dumps(exports, indent=2))
-    if len(exports) != 2 or any(
-        e["weight_version"] != 3 or e["manifest"] != expected for e in exports
-    ):
+    if len(exports) != 2 or any(e["weight_version"] != 3 or e["manifest"] != expected for e in exports):
         raise RuntimeError("actual actor parameters changed during inference stress")
     readbacks = ray.get(server.rlk_verify_current_policy.remote(str(path)))
     (root / "stress-v3-rollout-readback.json").write_text(json.dumps(readbacks, indent=2))
@@ -293,7 +277,7 @@ def stress_current_version(trainer, repeats):
     if len(readbacks) != 2:
         raise RuntimeError("final stress readback requires both actual PP stages")
     for ack in readbacks:
-        if ack["pid"] != pids[ack["pipeline_stage"]] or ack["weight_version"] != 3:
+        if worker_key(ack) != pids[ack["pipeline_stage"]] or ack["weight_version"] != 3:
             raise RuntimeError("stress readback came from a different live worker/policy")
         current = ack["verified_original_tensors"]
         if covered.intersection(current):

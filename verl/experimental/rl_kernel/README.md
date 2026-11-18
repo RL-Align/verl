@@ -114,3 +114,37 @@ results do not qualify this full trainer. Acceptance requires one uninterrupted
 three-update job, new generation after update three, complete evidence verification
 and a clean process exit. Do not infer DP2, a full model, multiple nodes, independent
 training-trajectory determinism or performance gains from this recipe.
+
+## Experimental multi-node PP2
+
+The `dsv4-rocm-multinode` change requires the updated RL-Kernel #711. It adds
+explicit per-role Ray node IPs, shared-storage/source/input preflight and checked
+actual node/rank/PCI placement. Each role still has exactly two PP ranks: either
+two GPUs on one host or one GPU on each of two hosts. TP/EP/CP/DP remain 1 and the
+model remains four layers with original ownership `0–2 / 3`. Full-model and
+additional parallel axes are still rejected/not supported by this recipe.
+
+Use `rlk.multinode=true`, `rlk.actor_node_ips=[...]` and
+`actor_rollout_ref.rollout.rlk_node_ips=[...]`, with matching `nnodes` and
+`n_gpus_per_node` (1x2 or 2x1) for each role. A shared filesystem at `rlk.sync_dir`
+is required; local directories with the same name are insufficient. Preflight
+hashes the checkpoint and input files on every selected node before GPU worker
+allocation. All nodes must run identical, clean source commits and dependency
+versions. The pinned vLLM's native multi-node `mp` executor and headless follower
+are reused; no new transport or modified upstream executor is introduced.
+
+Use RLK's `examples/operators/dsv4_4l/run_cluster_grpo.py` to attach to an existing
+allocated Ray cluster. The complete per-node bootstrap, two supported placements,
+submission and verifier commands are in
+[the AMD handoff guide](https://github.com/RL-Align/RL-Kernel/blob/vensen/dsv4-4l-pp2-dp2-20261116/docs/usage/dsv4-rocm-amd-handoff.md).
+After #711 merges, use the same path on `dsv4-rocm` and pin its commit.
+
+The existing versioned export/load/readback protocol now uses node-qualified
+process identities; equal PIDs on separate nodes are allowed, restarts are not.
+Actual actor and rollout PCI assignments must be disjoint on each node.
+Failures leave the job failed; no local or stale-policy fallback is enabled.
+The independent verifier checks placement against raw worker evidence.
+
+Validation for this extension is CPU-only. AMD multi-node model execution,
+RCCL behavior, numerical parity and performance are pending hardware testing.
+The historical single-node failure and GPU setup errors remain unresolved.

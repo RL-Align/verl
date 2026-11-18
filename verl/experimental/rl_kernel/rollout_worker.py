@@ -43,14 +43,12 @@ class RLKVerlDSV4Worker(Worker):
         from .runtime import process_identity
 
         self._rlk_source_identity = process_identity("vllm-mp-worker")
+        identity = self._rlk_source_identity
+        self._rlk_process_key = f"{identity['node_id']}:{identity['pid']}:{identity['process_instance']}"
         wrapper = self.model_runner.get_model()
         model = wrapper.model
-        self._rlk_source_identity["actual_model_class"] = (
-            type(wrapper).__module__ + "." + type(wrapper).__qualname__
-        )
-        self._rlk_source_identity["actual_model_source"] = __import__("inspect").getfile(
-            type(wrapper)
-        )
+        self._rlk_source_identity["actual_model_class"] = type(wrapper).__module__ + "." + type(wrapper).__qualname__
+        self._rlk_source_identity["actual_model_source"] = __import__("inspect").getfile(type(wrapper))
         self._rlk_pp_rank = get_pp_group().rank_in_group
         self._rlk_device_identity = hip_device_identity()
         self._rlk_worker = bind_mhc_worker(
@@ -112,9 +110,7 @@ class RLKVerlDSV4Worker(Worker):
             # The vLLM mp executor owns this process. Match its selected-token
             # provider ABI; sampling and token ordering remain owned by vLLM.
             def raw(logits, token_ids):
-                return selected_raw_logprobs(
-                    wrapper, logits, token_ids, weight_version=self._rlk_worker.version
-                )
+                return selected_raw_logprobs(wrapper, logits, token_ids, weight_version=self._rlk_worker.version)
 
             logprob.compute_token_logprobs = raw
 
@@ -126,9 +122,7 @@ class RLKVerlDSV4Worker(Worker):
         )
 
         wrapper = self.model_runner.get_model()
-        payload = pipeline_stage_payload(
-            wrapper, torch.load(path, map_location="cuda", weights_only=True)
-        )
+        payload = pipeline_stage_payload(wrapper, torch.load(path, map_location="cuda", weights_only=True))
         worker = self._rlk_worker
         version = payload["weight_version"]
         if version < worker.version or (version == worker.version and version != 0):
@@ -139,8 +133,7 @@ class RLKVerlDSV4Worker(Worker):
                 # without fabricating an optimizer update or a version advance.
                 stack.enter_context(worker.request(0))
                 loaded = {
-                    readback_original_tensor(wrapper, name, tensor)[0]
-                    for name, tensor in payload["weights"].items()
+                    readback_original_tensor(wrapper, name, tensor)[0] for name, tensor in payload["weights"].items()
                 }
             else:
                 stack.enter_context(worker.updating(version, torch.cuda.synchronize))
@@ -150,11 +143,22 @@ class RLKVerlDSV4Worker(Worker):
             source_identity=self._rlk_source_identity,
             pipeline_stage=self._rlk_pp_rank,
             pid=os.getpid(),
+            worker_identity=self._rlk_process_key,
+            node_id=self._rlk_source_identity["node_id"],
             device_identity=self._rlk_device_identity,
             original_layer_ids=list(range(wrapper.model.start_layer, wrapper.model.end_layer)),
             weight_version=worker.version,
             parameter_load_completed=True,
             verified_original_tensors=checked,
+        )
+
+    def rlk_placement(self):
+        return dict(
+            rank=self._rlk_pp_rank,
+            node_id=self._rlk_source_identity["node_id"],
+            pid=os.getpid(),
+            worker_identity=self._rlk_process_key,
+            **self._rlk_device_identity,
         )
 
     def rlk_readback_policy(self, path):
@@ -166,19 +170,16 @@ class RLKVerlDSV4Worker(Worker):
         )
 
         wrapper = self.model_runner.get_model()
-        payload = pipeline_stage_payload(
-            wrapper, torch.load(path, map_location="cuda", weights_only=True)
-        )
+        payload = pipeline_stage_payload(wrapper, torch.load(path, map_location="cuda", weights_only=True))
         if payload["weight_version"] != self._rlk_worker.version:
             raise RuntimeError("readback requested a stale policy")
         with self._rlk_worker.request(payload["weight_version"]):
-            names = {
-                readback_original_tensor(wrapper, name, tensor)[0]
-                for name, tensor in payload["weights"].items()
-            }
+            names = {readback_original_tensor(wrapper, name, tensor)[0] for name, tensor in payload["weights"].items()}
             checked = verify_loaded_update(wrapper, payload, names)
         return dict(
             pid=os.getpid(),
+            worker_identity=self._rlk_process_key,
+            node_id=self._rlk_source_identity["node_id"],
             pipeline_stage=self._rlk_pp_rank,
             weight_version=self._rlk_worker.version,
             readback_only=True,
@@ -190,9 +191,7 @@ class RLKVerlDSV4Worker(Worker):
 
         pattern = os.environ.get("RLK_TRACE_AUDIT_PATTERN")
         matched = pattern and re.fullmatch(pattern, label)
-        first = os.environ.get("RLK_TRACE_FIRST_AUDIT") == "1" and not getattr(
-            self, "_rlk_traced", False
-        )
+        first = os.environ.get("RLK_TRACE_FIRST_AUDIT") == "1" and not getattr(self, "_rlk_traced", False)
         if matched or first or label.startswith("failure-"):
             from examples.operators.dsv4_4l.boundary_trace import capture
 
@@ -200,7 +199,8 @@ class RLKVerlDSV4Worker(Worker):
             model._rlk_trace_worker = self._rlk_worker
             self._rlk_stop_trace = capture(
                 model,
-                f"/outputs/policy-sync/traces/rollout-rank-{self._rlk_pp_rank}-{label}",
+                f"{os.environ.get('RLK_SYNC_DIR', '/outputs/policy-sync')}/traces/"
+                f"rollout-rank-{self._rlk_pp_rank}-{label}",
                 "rollout",
             )
             self._rlk_traced = True
@@ -215,6 +215,8 @@ class RLKVerlDSV4Worker(Worker):
             self._rlk_stop_trace = None
         result = dict(
             pid=os.getpid(),
+            worker_identity=self._rlk_process_key,
+            node_id=self._rlk_source_identity["node_id"],
             pipeline_stage=self._rlk_pp_rank,
             weight_version=self._rlk_worker.version,
             batches=self._rlk_audit_batches,

@@ -44,6 +44,9 @@ class RLKTaskRunner:
         validate_trainer_config(config)
         config.transfer_queue.enable = True
         OmegaConf.resolve(config)
+        from .cluster import preflight
+
+        preflight(config)
         tq.init(config.transfer_queue)
         trainer = None
         succeeded = False
@@ -51,9 +54,7 @@ class RLKTaskRunner:
             trainer = RLKVerlTrainer(config)
             trainer.init()
             fqn = config.actor_rollout_ref.rollout.agent.get("agent_loop_manager_class")
-            manager_cls = (
-                load_class_from_fqn(fqn, "AgentLoopManager") if fqn else AgentLoopManagerTQ
-            )
+            manager_cls = load_class_from_fqn(fqn, "AgentLoopManager") if fqn else AgentLoopManagerTQ
             agents = manager_cls.create(
                 config=config,
                 llm_client=trainer.get_llm_client(),
@@ -83,9 +84,7 @@ def main(config):
     from .runtime import process_identity
 
     Path(config.rlk.sync_dir).mkdir(parents=True, exist_ok=True)
-    Path(config.rlk.sync_dir, "driver-identity.json").write_text(
-        json.dumps(process_identity("driver"), indent=2)
-    )
+    Path(config.rlk.sync_dir, "driver-identity.json").write_text(json.dumps(process_identity("driver"), indent=2))
     auto_set_device(config)
     validate_trainer_config(config)
     validate_config(config, use_reference_policy=False, use_critic=False)

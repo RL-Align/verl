@@ -9,6 +9,9 @@ hydra:
     - pkg://verl.trainer.config
 
 rlk:
+  multinode: false
+  actor_node_ips: []
+  preflight_files: []
   sync_dir: ???
   audit_prompts:
     - "Read this passage and then give one word: A small bird flies over a green field. A small bird flies over a green field. A small bird flies over a green field. A small bird flies over a green field. A small bird flies over a green field. A small bird flies over a green field. A small bird flies over a green field. A small bird flies over a green field. A small bird flies over a green field. A small bird flies over a green field. A small bird flies over a green field. A small bird flies over a green field. A small bird flies over a green field. A small bird flies over a green field. A small bird flies over a green field. A small bird flies over a green field. What color is the field?"
@@ -71,6 +74,8 @@ actor_rollout_ref:
         moe_permute_fusion: false
         moe_shared_expert_overlap: false
   rollout:
+    rlk_node_ips: []
+    rlk_sync_dir: ${rlk.sync_dir}
     _target_: rl_engine.integrations.orchestrators.verl.pipeline_rollout.RLKPipelineRolloutConfig
     name: vllm
     nnodes: 1

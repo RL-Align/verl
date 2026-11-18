@@ -17,6 +17,8 @@ import hashlib
 import json
 from pathlib import Path
 
+from .cluster_contract import topology, worker_key
+
 VERL_REVISION = "cc35929bf8eedf5f3eb7c4ace3441dfd9f6d4c0e"
 
 
@@ -33,11 +35,10 @@ def value(config, path, default=None):
 
 def validate_trainer_config(config):
     """Fail before allocating Ray resources for unimplemented combinations."""
+    topology(config)
     required = {
         "trainer.use_v1": True,
         "trainer.v1.trainer_mode": "sync",
-        "trainer.nnodes": 1,
-        "trainer.n_gpus_per_node": 2,
         "trainer.resume_mode": "disable",
         "algorithm.adv_estimator": "grpo",
         "algorithm.use_kl_in_reward": False,
@@ -60,8 +61,6 @@ def validate_trainer_config(config):
         "actor_rollout_ref.actor.megatron.use_remove_padding": False,
         "actor_rollout_ref.actor.megatron.use_fused_kernels": False,
         "actor_rollout_ref.rollout.name": "vllm",
-        "actor_rollout_ref.rollout.nnodes": 1,
-        "actor_rollout_ref.rollout.n_gpus_per_node": 2,
         "actor_rollout_ref.rollout.pipeline_model_parallel_size": 2,
         "actor_rollout_ref.rollout.tensor_model_parallel_size": 1,
         "actor_rollout_ref.rollout.data_parallel_size": 1,
@@ -78,11 +77,7 @@ def validate_trainer_config(config):
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu": 1,
         "actor_rollout_ref.rollout.checkpoint_engine.backend": "naive",
     }
-    errors = [
-        f"{key} must be {expected!r}"
-        for key, expected in required.items()
-        if value(config, key) != expected
-    ]
+    errors = [f"{key} must be {expected!r}" for key, expected in required.items() if value(config, key) != expected]
     for key in (
         "actor_rollout_ref.model.mtp.enable",
         "actor_rollout_ref.model.lora.rank",
@@ -97,9 +92,7 @@ def validate_trainer_config(config):
             errors.append(f"{key} is unsupported in this trainer")
     if value(config, "actor_rollout_ref.rollout.n", 0) < 2:
         errors.append("GRPO requires rollout.n >= 2")
-    if value(config, "actor_rollout_ref.actor.ppo_mini_batch_size") != value(
-        config, "data.train_batch_size"
-    ):
+    if value(config, "actor_rollout_ref.actor.ppo_mini_batch_size") != value(config, "data.train_batch_size"):
         errors.append("ppo_mini_batch_size must equal train_batch_size (both count prompts)")
     if value(config, "trainer.v1.sync.parameter_sync_step", 1) != 1:
         errors.append("this acceptance recipe requires parameter_sync_step=1")
@@ -136,7 +129,7 @@ def validate_stage_acks(acks, manifest, version, previous_pids=None):
     """Every original tensor must be read back once on the two live stages."""
     if len(acks) != 2 or {ack["pipeline_stage"] for ack in acks} != {0, 1}:
         raise RuntimeError("weight sync requires exactly two different PP stage acknowledgments")
-    pids = {ack["pipeline_stage"]: ack["pid"] for ack in acks}
+    pids = {ack["pipeline_stage"]: worker_key(ack) for ack in acks}
     if len(set(pids.values())) != 2 or (previous_pids is not None and pids != previous_pids):
         raise RuntimeError("rollout worker PIDs changed across the continuous update")
     checked = {}
@@ -176,8 +169,8 @@ def strict_response_parity(actor, rollout, response_mask):
         raise RuntimeError(
             f"actor/rollout raw logprob mismatch: {mismatch}/{left.numel()}; "
             f"first_position={position}, actor={float(left[index])}, rollout={float(right[index])}, "
-            f"actor_bits=0x{int(left.view(torch.int32)[index]) & 0xffffffff:08x}, "
-            f"rollout_bits=0x{int(right.view(torch.int32)[index]) & 0xffffffff:08x}"
+            f"actor_bits=0x{int(left.view(torch.int32)[index]) & 0xFFFFFFFF:08x}, "
+            f"rollout_bits=0x{int(right.view(torch.int32)[index]) & 0xFFFFFFFF:08x}"
         )
     delta = (left.double() - right.double()).abs()
     return dict(

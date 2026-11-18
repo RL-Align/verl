@@ -51,15 +51,24 @@ class RLKActorWorker(ActorRolloutRefWorker):
             raise RuntimeError("RLK trainer requires verl's native PPO/GRPO policy loss")
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def rlk_placement(self):
+        from rl_engine.integrations.common.device_identity import hip_device_identity
+
+        return dict(
+            rank=dist.get_rank(),
+            node_id=ray.get_runtime_context().get_node_id(),
+            pid=os.getpid(),
+            **hip_device_identity(),
+        )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def rlk_export_policy(self, path):
         from rl_engine.integrations.engines.rollout.vllm.checkpoint_sync import digest
 
         engine = self.actor.engine
         model = engine._rlk_models[0]
         covered = {
-            id(parameter)
-            for parameters in model._rlk_checkpoint_export_parameters.values()
-            for parameter in parameters
+            id(parameter) for parameters in model._rlk_checkpoint_export_parameters.values() for parameter in parameters
         }
         missing = [
             name
@@ -133,9 +142,7 @@ class RLKActorWorker(ActorRolloutRefWorker):
 
         handle = engine._rlk_models[0].register_forward_pre_hook(actual_forward, with_kwargs=True)
         stop_trace = None
-        first_trace = os.environ.get("RLK_TRACE_FIRST_AUDIT") == "1" and not getattr(
-            self, "_rlk_traced", False
-        )
+        first_trace = os.environ.get("RLK_TRACE_FIRST_AUDIT") == "1" and not getattr(self, "_rlk_traced", False)
         if trace_label is not None and not trace_label.startswith("failure-"):
             raise ValueError("explicit actor traces are restricted to failed-audit diagnostics")
         if first_trace or trace_label:
@@ -155,19 +162,12 @@ class RLKActorWorker(ActorRolloutRefWorker):
             handle.remove()
             if stop_trace is not None:
                 stop_trace()
-        if not observed or any(
-            row["shape"][0] != min(micro_batch_size, len(cases)) for row in observed
-        ):
+        if not observed or any(row["shape"][0] != min(micro_batch_size, len(cases)) for row in observed):
             raise RuntimeError(f"actor did not execute actual requested batch: {observed}")
         if output is None:
             return None
         scores = [
-            row[
-                len(case["prompt_ids"])
-                - 1 : len(case["prompt_ids"])
-                + len(case["response_ids"])
-                - 1
-            ]
+            row[len(case["prompt_ids"]) - 1 : len(case["prompt_ids"]) + len(case["response_ids"]) - 1]
             for row, case in zip(output["log_probs"].unbind(), cases, strict=True)
         ]
         return dict(weight_version=weight_version, scores=scores, forward_batches=observed)
@@ -185,6 +185,12 @@ class RLKVerlTrainer(PPOTrainerSync):
     def _init_resource_pool_mgr(self):
         super()._init_resource_pool_mgr()
         self.role_worker_mapping[Role.Actor] = ray.remote(RLKActorWorker)
+        if self.config.rlk.get("multinode", False):
+            from .cluster import actor_pool_manager
+
+            self.resource_pool_manager = actor_pool_manager(
+                self.resource_pool_manager, list(self.config.rlk.actor_node_ips), self.config.trainer.n_gpus_per_node
+            )
 
     def _setup(self):
         super()._setup()
@@ -199,9 +205,14 @@ class RLKVerlTrainer(PPOTrainerSync):
                 dict(zip(manager.server_addresses, manager.server_handles, strict=True))
             )
         )
-        self.checkpoint_manager = RLKPolicySync(
-            self.actor_rollout_wg, manager.server_handles, self.config.rlk.sync_dir
+        from .cluster import record_placement
+
+        record_placement(
+            self.config,
+            self.actor_rollout_wg.rlk_placement(),
+            ray.get(manager.server_handles[0].rlk_placement.remote()),
         )
+        self.checkpoint_manager = RLKPolicySync(self.actor_rollout_wg, manager.server_handles, self.config.rlk.sync_dir)
 
     def _compute_old_log_prob(self, batch, metrics):
         import transfer_queue as tq
@@ -226,12 +237,8 @@ class RLKVerlTrainer(PPOTrainerSync):
             dict(data.items(), prompt_lengths=prompt_lengths),
             root / f"parity-step{self.global_steps}-raw.pt",
         )
-        record = strict_response_parity(
-            data["old_log_probs"], data["rollout_log_probs"], data["response_mask"]
-        )
-        record.update(
-            global_steps=self.global_steps, weight_version=self.checkpoint_manager.version
-        )
+        record = strict_response_parity(data["old_log_probs"], data["rollout_log_probs"], data["response_mask"])
+        record.update(global_steps=self.global_steps, weight_version=self.checkpoint_manager.version)
         root = Path(self.config.rlk.sync_dir)
         with (root / "parity.jsonl").open("a") as stream:
             stream.write(json.dumps(record) + "\n")
@@ -283,9 +290,7 @@ class RLKVerlTrainer(PPOTrainerSync):
                 std=float(tensor.float().std(unbiased=False)),
                 values=tensor.tolist(),
             )
-        (
-            Path(self.config.rlk.sync_dir) / f"training-batch-step{self.global_steps}.json"
-        ).write_text(
+        (Path(self.config.rlk.sync_dir) / f"training-batch-step{self.global_steps}.json").write_text(
             json.dumps(
                 dict(
                     global_steps=self.global_steps,
@@ -301,9 +306,7 @@ class RLKVerlTrainer(PPOTrainerSync):
             )
         )
         if summaries["advantages"]["nonzero"] == 0:
-            raise RuntimeError(
-                "all native GRPO advantages are zero; this is not an effective update"
-            )
+            raise RuntimeError("all native GRPO advantages are zero; this is not an effective update")
         return batch
 
     def on_init_end(self):

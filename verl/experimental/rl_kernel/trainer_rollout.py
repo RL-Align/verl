@@ -28,10 +28,12 @@ class RLKTrainerVLLMServer(RLKPipelineVLLMHttpServer):
         os.environ["HIP_VISIBLE_DEVICES"] = visible
         os.environ["CUDA_VISIBLE_DEVICES"] = visible
         reservations = kwargs.pop("workers")
-        if kwargs["rollout_mode"] != RolloutMode.STANDALONE or len(reservations) != 2:
-            raise ValueError("expected the two standalone Ray GPU reservation workers")
+        if kwargs["rollout_mode"] != RolloutMode.STANDALONE or len(reservations) != kwargs["gpus_per_node"]:
+            raise ValueError("expected one reservation per local standalone GPU")
         # Match native MCore's original checkpoint ownership (layers 0-2 / 3).
         # These settings affect this dedicated server and its mp children only.
+        os.environ["RLK_NODE_ID"] = ray.get_runtime_context().get_node_id()
+        os.environ["RLK_SYNC_DIR"] = str(kwargs["config"].rlk_sync_dir or "/outputs/policy-sync")
         os.environ.update(
             VLLM_PP_LAYER_PARTITION="3,1",
             VLLM_ROCM_USE_AITER="1",
@@ -47,10 +49,11 @@ class RLKTrainerVLLMServer(RLKPipelineVLLMHttpServer):
     def _preprocess_engine_kwargs(self, engine_kwargs):
         super()._preprocess_engine_kwargs(engine_kwargs)
         engine_kwargs["worker_cls"] = "verl.experimental.rl_kernel.rollout_worker.RLKVerlDSV4Worker"
-        os.environ["RLK_VERL_MHC_BACKEND"] = self.config.engine_kwargs["vllm"].get(
-            "rlk_mhc_backend", "rocm_triton"
-        )
+        os.environ["RLK_VERL_MHC_BACKEND"] = self.config.engine_kwargs["vllm"].get("rlk_mhc_backend", "rocm_triton")
         engine_kwargs.pop("rlk_mhc_backend", None)
+
+    async def rlk_placement(self):
+        return await self.collective_rpc("rlk_placement")
 
     async def rlk_load_policy(self, path, global_steps):
         if not self._submission_paused:
@@ -124,3 +127,12 @@ class RLKTrainerReplica(vLLMReplica):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.server_class = ray.remote(RLKTrainerVLLMServer)
+
+    async def init_standalone(self, resource_pool=None):
+        if self.config.rlk_node_ips:
+            from .cluster import pinned_pool
+
+            if resource_pool is not None:
+                raise ValueError("explicit placement cannot also take an external pool")
+            resource_pool = pinned_pool(list(self.config.rlk_node_ips), self.gpus_per_replica_node, "rlk-rollout", 2)
+        await super().init_standalone(resource_pool)

@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prepare a Ray process before deserializing GPU-owning actor classes."""
+
 import os
+import socket
+from uuid import uuid4
+
+_PROCESS_INSTANCE = {}
 
 
 def prepare_worker():
@@ -58,13 +63,19 @@ def process_identity(role):
     identity = dict(
         role=role,
         pid=os.getpid(),
+        hostname=socket.gethostname(),
+        node_id=(
+            ray.get_runtime_context().get_node_id()
+            if ray.is_initialized()
+            else os.environ.get("RLK_NODE_ID", socket.gethostname())
+        ),
+        process_instance=_PROCESS_INSTANCE.setdefault(os.getpid(), uuid4().hex),
         projects=projects,
         dependencies=dependencies,
         hip=torch.version.hip,
         ray_accelerator_ids=ray_ids,
         visibility={
-            k: os.environ.get(k)
-            for k in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
+            k: os.environ.get(k) for k in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")
         },
     )
     print("RLK_PROCESS_IDENTITY", identity, flush=True)
