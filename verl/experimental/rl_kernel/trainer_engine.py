@@ -53,6 +53,7 @@ def bind_actor_operators(model):
     from rl_engine.integrations.engines.train.megatron.native_router_projection import (
         bind_native_router_projection,
     )
+    from rl_engine.integrations.engines.train.megatron.native_indexer import bind_native_fp8_indexer
     from rl_engine.integrations.engines.train.megatron.native_sparse import bind_native_sparse
     from rl_engine.integrations.engines.train.megatron.native_w4a16 import bind_native_w4a16
 
@@ -67,6 +68,7 @@ def bind_actor_operators(model):
             )
         if getattr(attention.core_attention, "indexer", None) is not None:
             bind_compressor_projection(attention.core_attention.indexer.compressor)
+            bind_native_fp8_indexer(attention.core_attention, attention._rlk_qkv_preprocess)
     for layer in model.decoder.layers[1::2]:
         mlp = layer.inner_layer.mlp
         bind_native_router_projection(mlp.router)
