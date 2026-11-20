@@ -371,6 +371,38 @@ class RLKVerlTrainer(PPOTrainerSync):
         if self.global_steps == 3 and repeats:
             stress_current_version(self, repeats)
 
+    def step(self, metrics, timing_raw):
+        """Retain native phase timers even when a strict acceptance gate fails."""
+        import time
+
+        started = time.perf_counter()
+        status, failure = "step_body_returned", None
+        try:
+            return super().step(metrics, timing_raw)
+        except BaseException as error:
+            status, failure = "failed", type(error).__name__
+            raise
+        finally:
+            root = Path(self.config.rlk.sync_dir)
+            record = dict(
+                global_steps=self.global_steps,
+                rollout_weight_version_before_sync=self.checkpoint_manager.version,
+                phase_status=status,
+                failure_type=failure,
+                native_phase_seconds={name: float(value) for name, value in timing_raw.items()},
+                step_body_seconds=time.perf_counter() - started,
+                includes_weight_sync=False,
+                completed_end_to_end_step=False,
+                notes=(
+                    "Native gen includes AgentLoop generation/reward wait. Sync and post-update audits occur "
+                    "after the step body; only metrics-stepN.json certifies completed step timing."
+                ),
+            )
+            destination = root / f"phase-metrics-step{self.global_steps}.json"
+            temporary = destination.with_suffix(".pending")
+            temporary.write_text(json.dumps(record, indent=2))
+            os.replace(temporary, destination)
+
     def _compute_metrics(self, batch, metrics, timing_raw, global_steps, epoch):
         super()._compute_metrics(batch, metrics, timing_raw, global_steps, epoch)
 
