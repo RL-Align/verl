@@ -33,9 +33,7 @@ def test_all_effective_response_tokens_and_real_bos_zero_are_retained():
 
 def test_original_fp32_one_bit_failure_is_recorded_without_rounding():
     data, kwargs = fixture()
-    data["rollout_log_probs"][0, 0] = torch.nextafter(
-        data["old_log_probs"][0, 0], torch.tensor(0.0)
-    )
+    data["rollout_log_probs"][0, 0] = torch.nextafter(data["old_log_probs"][0, 0], torch.tensor(0.0))
     record = response_batch_record(data, **kwargs)
     assert record["mismatch_count"] == 1 and record["per_response_mismatch_count"] == [
         1,
@@ -56,9 +54,7 @@ def test_incomplete_or_misaligned_observations_fail_closed(problem):
     elif problem == "shifted_mask":
         data["response_mask"][1] = torch.tensor([0, 1])
     elif problem == "mixed_version":
-        kwargs["metadata"] = [
-            dict(global_steps=4, min_global_steps=4, max_global_steps=4)
-        ] * 2
+        kwargs["metadata"] = [dict(global_steps=4, min_global_steps=4, max_global_steps=4)] * 2
     elif problem == "wrong_dtype":
         data["rollout_log_probs"] = data["rollout_log_probs"].bfloat16()
     with pytest.raises((ValueError, TypeError)):

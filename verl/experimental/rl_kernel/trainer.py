@@ -238,8 +238,7 @@ class RLKVerlTrainer(PPOTrainerSync):
             select_fields=["extra_fields"],
         )["extra_fields"]
         metadata = [
-            {key: int(row[key]) for key in ("global_steps", "min_global_steps", "max_global_steps")}
-            for row in metadata
+            {key: int(row[key]) for key in ("global_steps", "min_global_steps", "max_global_steps")} for row in metadata
         ]
         data = data.to_padded_tensor()
         root = Path(self.config.rlk.sync_dir)
@@ -277,19 +276,13 @@ class RLKVerlTrainer(PPOTrainerSync):
             verified_sync_pp_ranks=ranks,
             missing_ranks=[],
         )
-        (root / f"training-parity-step{self.global_steps}.json").write_text(
-            json.dumps(record, indent=2)
-        )
+        (root / f"training-parity-step{self.global_steps}.json").write_text(json.dumps(record, indent=2))
         root = Path(self.config.rlk.sync_dir)
         with (root / "parity.jsonl").open("a") as stream:
             stream.write(json.dumps(record) + "\n")
-        strict_response_parity(
-            data["old_log_probs"], data["rollout_log_probs"], data["response_mask"]
-        )
+        strict_response_parity(data["old_log_probs"], data["rollout_log_probs"], data["response_mask"])
         metrics["rlk/parity_check_seconds"] = record["comparison_seconds"]
-        metrics.update(
-            {f"rlk/{key}": record[key] for key in ("compared_tokens", "mismatch_count")}
-        )
+        metrics.update({f"rlk/{key}": record[key] for key in ("compared_tokens", "mismatch_count")})
         return batch
 
     def _compute_advantage(self, batch, metrics):
