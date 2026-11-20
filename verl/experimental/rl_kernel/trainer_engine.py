@@ -53,6 +53,7 @@ def bind_actor_operators(model):
     from rl_engine.integrations.engines.train.megatron.native_router_projection import (
         bind_native_router_projection,
     )
+    from rl_engine.integrations.engines.train.megatron.native_indexer import bind_native_fp8_indexer
     from rl_engine.integrations.engines.train.megatron.native_sparse import bind_native_sparse
     from rl_engine.integrations.engines.train.megatron.native_w4a16 import bind_native_w4a16
 
@@ -62,11 +63,10 @@ def bind_actor_operators(model):
         bind_native_inverse_rope(attention)
         if getattr(attention.core_attention, "compressor", None) is not None:
             bind_compressor_projection(attention.core_attention.compressor)
-            bind_native_compressor(
-                attention.core_attention.compressor, attention._rlk_qkv_preprocess
-            )
+            bind_native_compressor(attention.core_attention.compressor, attention._rlk_qkv_preprocess)
         if getattr(attention.core_attention, "indexer", None) is not None:
             bind_compressor_projection(attention.core_attention.indexer.compressor)
+            bind_native_fp8_indexer(attention.core_attention, attention._rlk_qkv_preprocess)
     for layer in model.decoder.layers[1::2]:
         mlp = layer.inner_layer.mlp
         bind_native_router_projection(mlp.router)
@@ -117,9 +117,7 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
                         actual_model_class=type(self._rlk_models[0]).__module__
                         + "."
                         + type(self._rlk_models[0]).__qualname__,
-                        actual_model_source=__import__("inspect").getfile(
-                            type(self._rlk_models[0])
-                        ),
+                        actual_model_source=__import__("inspect").getfile(type(self._rlk_models[0])),
                         trainable_inventory={
                             name: dict(shape=list(p.shape), dtype=str(p.dtype), elements=p.numel())
                             for name, p in self._rlk_models[0].named_parameters()
@@ -130,9 +128,7 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
                             "verl.experimental.rl_kernel.runtime", fromlist=["process_identity"]
                         ).process_identity("actor"),
                         device_identity=hip_device_identity(),
-                        original_layer_ids=list(
-                            self._rlk_models[0]._rlk_checkpoint_stage.layer_ids
-                        ),
+                        original_layer_ids=list(self._rlk_models[0]._rlk_checkpoint_stage.layer_ids),
                     ),
                     indent=2,
                 )
@@ -149,13 +145,9 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
         actual_max = max(len(row) for row in batch["input_ids"].unbind())
         tu.assign_non_tensor(
             batch,
-            forced_max_seqlen=max(
-                int(forced), actual_max, int(getattr(self.tf_config, "csa_window_size", 1))
-            ),
+            forced_max_seqlen=max(int(forced), actual_max, int(getattr(self.tf_config, "csa_window_size", 1))),
         )
-        return super().forward_step(
-            iter((batch,)), model, logits_processor_func, postprocess_micro_batch_func
-        )
+        return super().forward_step(iter((batch,)), model, logits_processor_func, postprocess_micro_batch_func)
 
     def _lm_head_logits_processor(self, logits, label, temperature, **kwargs):
         # Padded temperature entries are zero; only nonpadding entries may be 1.
@@ -232,7 +224,7 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
         if self.engine_config.rlk_evidence_dir:
             (
                 Path(self.engine_config.rlk_evidence_dir)
-                / f"native-loss-rank{dist.get_rank()}-v{self.rlk_weight_version+1}.json"
+                / f"native-loss-rank{dist.get_rank()}-v{self.rlk_weight_version + 1}.json"
             ).write_text(json.dumps(calls, indent=2))
         return result
 
@@ -264,18 +256,14 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
                 gradients.append(gradient)
                 gradient_records[name] = tensor_record(gradient)
         finite = all(bool(torch.isfinite(gradient).all()) for gradient in gradients)
-        finite = finite and all(
-            row["finite"] for rows in self._rlk_autograd_receipts.values() for row in rows
-        )
+        finite = finite and all(row["finite"] for rows in self._rlk_autograd_receipts.values() for row in rows)
         missing_effective = [
             name
             for name, record in gradient_records.items()
             if record["nonzero"] and not self._rlk_autograd_receipts.get(name)
         ]
         if missing_effective:
-            raise RuntimeError(
-                f"effective optimizer gradients lack actual autograd receipt: {missing_effective}"
-            )
+            raise RuntimeError(f"effective optimizer gradients lack actual autograd receipt: {missing_effective}")
         if not finite:
             raise RuntimeError("nonfinite actor gradients before the native optimizer step")
         nonzero = any(bool(torch.count_nonzero(gradient)) for gradient in gradients)
@@ -290,13 +278,9 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
             previous=self._rlk_previous_optimizer,
         )
         self._rlk_previous_optimizer = optimizer_after
-        changed = [
-            name for name, parameter in parameters.items() if digest(parameter) != before[name]
-        ]
+        changed = [name for name, parameter in parameters.items() if digest(parameter) != before[name]]
         if not changed:
-            raise RuntimeError(
-                "native optimizer did not change any trainable parameter on this PP stage"
-            )
+            raise RuntimeError("native optimizer did not change any trainable parameter on this PP stage")
         if self.engine_config.rlk_evidence_dir:
             root = Path(self.engine_config.rlk_evidence_dir)
             root.mkdir(parents=True, exist_ok=True)
