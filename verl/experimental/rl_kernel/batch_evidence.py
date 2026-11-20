@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Individual Contributor
 """Complete response-token coverage and original FP32 words for a native batch."""
 
 import collections
