@@ -67,10 +67,10 @@ class RLKVerlDSV4Worker(Worker):
         bind_shared_down(model, self._rlk_worker)
         for index in range(model.start_layer, model.end_layer):
             layer = model.layers[index]
+            from rl_engine.integrations.engines.rollout.vllm.c128_compressor import bind_single_pass_c128
             from rl_engine.integrations.engines.rollout.vllm.compressor_projection import (
                 bind_rollout_compressor_projection,
             )
-            from rl_engine.integrations.engines.rollout.vllm.c128_compressor import bind_single_pass_c128
             from rl_engine.integrations.engines.rollout.vllm.fixed_combine import bind_fixed_combine
 
             bind_fixed_combine(layer.ffn)
