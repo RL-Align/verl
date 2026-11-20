@@ -231,18 +231,65 @@ class RLKVerlTrainer(PPOTrainerSync):
         )
         # Preserve native lengths: DSV4's BOS is token 0, also the padded export fill.
         prompt_lengths = data["prompts"].offsets().diff().detach().cpu()
+        response_lengths = data["responses"].offsets().diff().detach().cpu()
+        metadata = tq.kv_batch_get(
+            keys=batch.keys,
+            partition_id=batch.partition_id,
+            select_fields=["extra_fields"],
+        )["extra_fields"]
+        metadata = [
+            {key: int(row[key]) for key in ("global_steps", "min_global_steps", "max_global_steps")}
+            for row in metadata
+        ]
         data = data.to_padded_tensor()
         root = Path(self.config.rlk.sync_dir)
         torch.save(
-            dict(data.items(), prompt_lengths=prompt_lengths),
+            dict(
+                data.items(),
+                prompt_lengths=prompt_lengths,
+                response_lengths=response_lengths,
+                weight_version=self.checkpoint_manager.version,
+                global_steps=self.global_steps,
+                native_rollout_metadata=metadata,
+            ),
             root / f"parity-step{self.global_steps}-raw.pt",
         )
-        record = strict_response_parity(data["old_log_probs"], data["rollout_log_probs"], data["response_mask"])
-        record.update(global_steps=self.global_steps, weight_version=self.checkpoint_manager.version)
+        import time
+        from .batch_evidence import response_batch_record
+
+        started = time.perf_counter()
+        record = response_batch_record(
+            data,
+            prompt_lengths.tolist(),
+            response_lengths.tolist(),
+            prompts=int(self.config.data.train_batch_size),
+            samples=int(self.config.actor_rollout_ref.rollout.n),
+            version=self.checkpoint_manager.version,
+            metadata=metadata,
+        )
+        record["comparison_seconds"] = time.perf_counter() - started
+        ranks = sorted(self.checkpoint_manager.pids)
+        if ranks != [0, 1]:
+            raise RuntimeError("missing native PP rank in the verified policy synchronization")
+        record.update(
+            global_steps=self.global_steps,
+            weight_version=self.checkpoint_manager.version,
+            verified_sync_pp_ranks=ranks,
+            missing_ranks=[],
+        )
+        (root / f"training-parity-step{self.global_steps}.json").write_text(
+            json.dumps(record, indent=2)
+        )
         root = Path(self.config.rlk.sync_dir)
         with (root / "parity.jsonl").open("a") as stream:
             stream.write(json.dumps(record) + "\n")
-        metrics.update({f"rlk/{key}": record[key] for key in ("compared_tokens", "mismatch_count")})
+        strict_response_parity(
+            data["old_log_probs"], data["rollout_log_probs"], data["response_mask"]
+        )
+        metrics["rlk/parity_check_seconds"] = record["comparison_seconds"]
+        metrics.update(
+            {f"rlk/{key}": record[key] for key in ("compared_tokens", "mismatch_count")}
+        )
         return batch
 
     def _compute_advantage(self, batch, metrics):
