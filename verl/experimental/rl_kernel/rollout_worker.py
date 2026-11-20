@@ -68,6 +68,9 @@ class RLKVerlDSV4Worker(Worker):
                 bind_rollout_compressor_projection,
             )
 
+            from rl_engine.integrations.engines.rollout.vllm.fixed_combine import bind_fixed_combine
+
+            bind_fixed_combine(layer.ffn)
             bind_rollout_compressor_projection(layer.attn)
             bind_rollout_router_projection(layer.ffn.gate)
             bind_rollout_sparse(layer.attn)
