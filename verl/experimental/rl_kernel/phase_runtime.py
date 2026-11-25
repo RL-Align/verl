@@ -164,6 +164,7 @@ def build_actor(args, *, training=False):
             rlk_allow_right_padding=True,
             rlk_evidence_dir=str(args.output),
             rlk_require_update_forward_parity=training,
+            rlk_sparse_workspace_bytes=4 << 30,
             tensor_model_parallel_size=1,
             expert_tensor_parallel_size=1,
             pipeline_model_parallel_size=2,
@@ -469,6 +470,7 @@ async def rollout_phase(args):
     os.environ["RLK_PHASE_BOOTSTRAP_POLICY"] = str(args.policy)
     os.environ.pop("VLLM_PP_LAYER_PARTITION", None)
     os.environ["RLK_VERL_MHC_BACKEND"] = "rocm_triton"
+    os.environ["RLK_VERL_SPARSE_WORKSPACE_BYTES"] = str(4 << 30)
     os.environ["VLLM_ROCM_USE_AITER"] = "1"
     ray.init(
         address="local",
@@ -476,7 +478,7 @@ async def rollout_phase(args):
         num_gpus=0,
         include_dashboard=False,
         namespace="dsv4-phase-" + uuid4().hex,
-        _temp_dir="/tmp/rv4-" + uuid4().hex[:8],
+        _temp_dir="/tmp/rv4/" + uuid4().hex[:8],
     )
     config = RolloutConfig(
         name="vllm",

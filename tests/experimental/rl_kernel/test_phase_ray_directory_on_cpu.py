@@ -27,7 +27,7 @@ def test_actual_phase_ray_directory_fits_native_socket_limit_and_is_private():
     paths = [eval(expression, {"uuid4": uuid4}) for _ in range(8)]
     assert len(set(paths)) == len(paths)
     for root in paths:
-        assert Path(root).parent == Path("/tmp")
+        assert Path(root).parent == Path("/tmp/rv4")
         socket = root + "/session_2026-11-25_13-56-31_204231_999999/sockets/plasma_store"
         validate_socket_filepath(socket)
         assert len(socket.encode()) <= 107

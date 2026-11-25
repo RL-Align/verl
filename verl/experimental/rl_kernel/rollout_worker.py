@@ -75,7 +75,9 @@ class RLKVerlDSV4Worker(Worker):
 
             bind_rollout_compressor_projection(layer.attn)
             bind_rollout_router_projection(layer.ffn.gate)
-            bind_rollout_sparse(layer.attn)
+            bind_rollout_sparse(
+                layer.attn, max_workspace_bytes=int(os.environ.get("RLK_VERL_SPARSE_WORKSPACE_BYTES", 1 << 30))
+            )
             bind_original_group_projection(layer.attn, self.model_config.model, index)
             bind_rollout_decode(layer.attn)
         from rl_engine.integrations.engines.rollout.vllm.batch_order import bind_prefill_order

@@ -33,7 +33,7 @@ from verl.workers.engine.base import EngineRegistry
 from .trainer_contract import logical_cases
 
 
-def bind_actor_operators(model):
+def bind_actor_operators(model, *, sparse_workspace_bytes=1 << 30):
     from rl_engine.integrations.engines.train.megatron.native_combine import bind_native_combine
     from rl_engine.integrations.engines.train.megatron.native_compressor import (
         bind_native_compressor,
@@ -58,7 +58,7 @@ def bind_actor_operators(model):
 
     for layer in model.decoder.layers[::2]:
         attention = layer.inner_layer.self_attention
-        bind_native_sparse(attention.core_attention)
+        bind_native_sparse(attention.core_attention, max_workspace_bytes=sparse_workspace_bytes)
         bind_native_inverse_rope(attention)
         if getattr(attention.core_attention, "compressor", None) is not None:
             bind_compressor_projection(attention.core_attention.compressor)
@@ -80,6 +80,7 @@ class RLKVerlMcoreEngineConfig(RLKNativeMcoreEngineConfig):
     rlk_allow_right_padding: bool = True
     rlk_evidence_dir: str = ""
     rlk_require_update_forward_parity: bool = False
+    rlk_sparse_workspace_bytes: int = 1 << 30
 
     def __post_init__(self):
         if self.strategy != "rlk_verl_megatron":
@@ -96,7 +97,7 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
     def initialize(self):
         super().initialize()
         for model in self._rlk_models:
-            bind_actor_operators(model)
+            bind_actor_operators(model, sparse_workspace_bytes=self.engine_config.rlk_sparse_workspace_bytes)
         from examples.operators.dsv4_4l.distributed_evidence import PipelineBoundaryEvidence
 
         self._rlk_boundary = PipelineBoundaryEvidence(self._rlk_models[0], dp_rank=0)
