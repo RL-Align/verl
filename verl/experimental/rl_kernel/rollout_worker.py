@@ -54,12 +54,17 @@ class RLKVerlDSV4Worker(Worker):
         self._rlk_source_identity["actual_model_source"] = __import__("inspect").getfile(type(wrapper))
         self._rlk_pp_rank = get_pp_group().rank_in_group
         self._rlk_device_identity = hip_device_identity()
+        bootstrap_path = os.environ.get("RLK_PHASE_BOOTSTRAP_POLICY")
+        bootstrap = torch.load(bootstrap_path, map_location="cuda", weights_only=True) if bootstrap_path else None
+        phase_version = bootstrap["weight_version"] if bootstrap else 0
+        if type(phase_version) is not int or phase_version < 0:
+            raise ValueError("invalid phase bootstrap weight version")
         self._rlk_worker = bind_mhc_worker(
             model,
             "rollout",
             backend=os.environ.get("RLK_VERL_MHC_BACKEND", "rocm_triton"),
             mode="split",
-            version=0,
+            version=phase_version,
         )
         bind_shared_down(model, self._rlk_worker)
         for index in range(model.start_layer, model.end_layer):
@@ -117,6 +122,72 @@ class RLKVerlDSV4Worker(Worker):
 
             logprob.compute_token_logprobs = raw
 
+        if bootstrap is not None:
+            from rl_engine.integrations.engines.rollout.vllm.checkpoint_sync import (
+                pipeline_stage_payload,
+                readback_original_tensor,
+                verify_loaded_update,
+            )
+
+            payload = pipeline_stage_payload(wrapper, bootstrap)
+            with self._rlk_worker.request(phase_version):
+                if phase_version == 0:
+                    loaded = {readback_original_tensor(wrapper, n, t)[0] for n, t in payload["weights"].items()}
+                else:
+                    # This is a newly constructed process with no admitted requests or old KV.
+                    loaded = wrapper.load_weights(payload["weights"].items())
+                checked = verify_loaded_update(wrapper, payload, loaded)
+            from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+
+            self._rlk_phase_bootstrap = dict(
+                weight_version=phase_version,
+                parameter_load_completed=True,
+                tensor_parallel_rank=get_tensor_model_parallel_rank(),
+                tensor_parallel_size=get_tensor_model_parallel_world_size(),
+                pipeline_stage=self._rlk_pp_rank,
+                pid=os.getpid(),
+                device_identity=self._rlk_device_identity,
+                original_layer_ids=list(range(model.start_layer, model.end_layer)),
+                verified_original_tensors=checked,
+                lifecycle="fresh worker; policy loaded/read back before admission; no residency claim",
+            )
+
+    def rlk_phase_bootstrap_ack(self):
+        if not hasattr(self, "_rlk_phase_bootstrap"):
+            raise RuntimeError("phase worker did not bootstrap and read back the requested policy")
+        return self._rlk_phase_bootstrap
+
+    def rlk_phase_readback_dump(self, policy_path, directory):
+        """Persist actual module tensor bytes for the independent CPU verifier."""
+        import hashlib
+        from pathlib import Path
+
+        from rl_engine.integrations.engines.rollout.vllm.checkpoint_sync import (
+            pipeline_stage_payload,
+            readback_original_tensor,
+        )
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        payload = pipeline_stage_payload(
+            self.model_runner.get_model(), torch.load(policy_path, map_location="cpu", weights_only=True)
+        )
+        if payload["weight_version"] != self._rlk_worker.version:
+            raise RuntimeError("raw readback requested a stale policy")
+        wrapper = self.model_runner.get_model()
+        actual = {}
+        with self._rlk_worker.request(self._rlk_worker.version):
+            for name, value in payload["weights"].items():
+                actual[name] = readback_original_tensor(wrapper, name, value)[2].detach().cpu().clone()
+        root = Path(directory)
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"pp{self._rlk_pp_rank}-tp{get_tensor_model_parallel_rank()}.pt"
+        if path.exists():
+            raise FileExistsError("retain previous raw readback rather than overwrite")
+        torch.save(dict(weight_version=self._rlk_worker.version, tensors=actual), path)
+        with path.open("rb") as source:
+            sha = hashlib.file_digest(source, "sha256").hexdigest()
+        return dict(self._rlk_phase_bootstrap, raw_readback_file=str(path), raw_readback_sha256=sha)
+
     def rlk_sync_weights(self, path):
         from rl_engine.integrations.engines.rollout.vllm.checkpoint_sync import (
             pipeline_stage_payload,
@@ -156,8 +227,14 @@ class RLKVerlDSV4Worker(Worker):
         )
 
     def rlk_placement(self):
+        from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+
+        tp_rank, tp = get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()
         return dict(
-            rank=self._rlk_pp_rank,
+            rank=self._rlk_pp_rank * tp + tp_rank,
+            tensor_parallel_rank=tp_rank,
+            tensor_parallel_size=tp,
+            pipeline_stage=self._rlk_pp_rank,
             node_id=self._rlk_source_identity["node_id"],
             pid=os.getpid(),
             worker_identity=self._rlk_process_key,
