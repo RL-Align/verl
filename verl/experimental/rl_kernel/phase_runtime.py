@@ -476,7 +476,7 @@ async def rollout_phase(args):
         num_gpus=0,
         include_dashboard=False,
         namespace="dsv4-phase-" + uuid4().hex,
-        _temp_dir="/tmp/dsv4-phase-ray-" + uuid4().hex,
+        _temp_dir="/tmp/rv4-" + uuid4().hex[:8],
     )
     config = RolloutConfig(
         name="vllm",
