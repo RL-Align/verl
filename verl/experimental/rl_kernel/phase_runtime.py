@@ -217,7 +217,23 @@ def actor_score(args):
     scores, batches = [], []
     for batch_id, batch_cases in groups(cases):
         start = time.monotonic()
-        result = worker.infer_batch(make_data(batch_cases, microbatch=len(batch_cases)))
+        import re
+        from contextlib import ExitStack
+
+        with ExitStack() as trace:
+            pattern = os.environ.get("RLK_TRACE_AUDIT_PATTERN")
+            if pattern and re.fullmatch(pattern, batch_id):
+                from examples.operators.dsv4_4l.boundary_trace import capture
+
+                for local, model in enumerate(worker.engine._rlk_models):
+                    trace.callback(
+                        capture(
+                            model,
+                            args.output / "traces" / f"actor-rank-{dist.get_rank()}-chunk-{local}-{batch_id}",
+                            "actor",
+                        )
+                    )
+            result = worker.infer_batch(make_data(batch_cases, microbatch=len(batch_cases)))
         if result is not None:
             values = result["log_probs"]
             for row, case in zip(values.unbind(), batch_cases, strict=True):

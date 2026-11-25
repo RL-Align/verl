@@ -60,7 +60,7 @@ def verify(args):
             raise ValueError("policy payload differs from its original-tensor manifest: " + name)
         original_dtype = {"BF16": torch.bfloat16, "F32": torch.float32, "I64": torch.int64}[eligible[name]["dtype"]]
         if value.dtype != original_dtype or list(value.shape) != eligible[name]["shape"]:
-            raise ValueError("policy changed original tensor shape: " + name)
+            raise ValueError("policy changed original tensor shape or dtype: " + name)
         if payload["weight_version"] == 0 and tensor_sha(value) != eligible[name]["sha256"]:
             raise ValueError("initial policy differs from original frozen snapshot: " + name)
     readbacks = read(args.rollout / "policy-raw-readback.json")

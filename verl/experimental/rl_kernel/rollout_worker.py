@@ -22,9 +22,10 @@ from vllm.v1.worker.gpu_worker import Worker
 
 class RLKVerlDSV4Worker(Worker):
     def load_model(self, **kwargs):
+        from rl_engine.integrations.engines.rollout.vllm.hash_table import original_hash_table_loading
         from rl_engine.integrations.engines.rollout.vllm.mi35x_moe import native_w4a16_loading
 
-        with native_w4a16_loading():
+        with native_w4a16_loading(), original_hash_table_loading():
             super().load_model(**kwargs)
         from rl_engine.integrations.common.device_identity import hip_device_identity
         from rl_engine.integrations.engines.rollout.vllm.group_projection import (
