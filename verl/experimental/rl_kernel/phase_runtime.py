@@ -501,8 +501,25 @@ def actor_audit(args):
         if [c["id"] for c in cases] != [c["id"] for c in expected_cases]:
             raise ValueError("fresh generation and logical suite differ")
     scores = []
-    for _, batch_cases in groups(cases):
-        scores.extend(score_batch(worker, batch_cases))
+    for batch_id, batch_cases in groups(cases):
+        import re
+        from contextlib import ExitStack
+
+        # Optional diagnostic capture; unset env var means no behaviour change.
+        with ExitStack() as trace:
+            pattern = os.environ.get("RLK_TRACE_AUDIT_PATTERN")
+            if pattern and re.fullmatch(pattern, batch_id):
+                from examples.operators.dsv4_4l.boundary_trace import capture
+
+                for local, model in enumerate(worker.engine._rlk_models):
+                    trace.callback(
+                        capture(
+                            model,
+                            args.output / "traces" / f"actor-rank-{dist.get_rank()}-chunk-{local}-{batch_id}",
+                            "actor",
+                        )
+                    )
+            scores.extend(score_batch(worker, batch_cases))
     if is_score_writer(worker):
         save_scores(args.output, cases, scores, identity, suite_hash, args.snapshot_sha256)
     if state_digest(worker.engine.optimizer.state_dict()) != before:
