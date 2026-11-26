@@ -65,6 +65,11 @@ def bind_actor_operators(model, *, sparse_workspace_bytes=1 << 30):
             bind_native_compressor(attention.core_attention.compressor, attention._rlk_qkv_preprocess)
         if getattr(attention.core_attention, "indexer", None) is not None:
             bind_compressor_projection(attention.core_attention.indexer.compressor)
+            from rl_engine.integrations.engines.train.megatron.native_compressor_projection import (
+                bind_indexer_weights_proj,
+            )
+
+            bind_indexer_weights_proj(attention.core_attention.indexer)
             from rl_engine.integrations.engines.train.megatron.native_indexer import bind_production_indexer
 
             bind_production_indexer(attention.core_attention, attention._rlk_qkv_preprocess)

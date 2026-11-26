@@ -75,6 +75,11 @@ class RLKVerlDSV4Worker(Worker):
         bind_shared_down(model, self._rlk_worker)
         bind_rollout_fixed_routed_combine()
         bind_rollout_deterministic_indexer_topk()
+        from rl_engine.integrations.engines.rollout.vllm.indexer_paged_logits import (
+            bind_rollout_paged_indexer_logits,
+        )
+
+        bind_rollout_paged_indexer_logits()
         from rl_engine.backends.rocm.attention.compressor_schedule import pin_c128_compressor_schedule
 
         pin_c128_compressor_schedule()
@@ -100,10 +105,12 @@ class RLKVerlDSV4Worker(Worker):
             from rl_engine.integrations.engines.rollout.vllm.compressor_projection import (
                 bind_rollout_compressor_projection,
             )
+            from rl_engine.integrations.engines.rollout.vllm.indexer_paged_logits import bind_rollout_weights_proj
             from rl_engine.integrations.engines.rollout.vllm.q_up_projection import bind_q_up_projection
 
             bind_q_up_projection(layer.attn)
             bind_rollout_compressor_projection(layer.attn)
+            bind_rollout_weights_proj(layer.attn)
             bind_rollout_router_projection(layer.ffn.gate)
             bind_rollout_sparse(
                 layer.attn, max_workspace_bytes=int(os.environ.get("RLK_VERL_SPARSE_WORKSPACE_BYTES", 1 << 30))
