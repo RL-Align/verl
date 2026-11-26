@@ -25,6 +25,7 @@ class RLKVerlDSV4Worker(Worker):
         from rl_engine.integrations.engines.rollout.vllm.hash_table import original_hash_table_loading
         from rl_engine.integrations.engines.rollout.vllm.mi35x_moe import native_w4a16_loading
 
+        os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
         with native_w4a16_loading(), original_hash_table_loading():
             super().load_model(**kwargs)
         from rl_engine.integrations.common.device_identity import hip_device_identity
@@ -70,6 +71,23 @@ class RLKVerlDSV4Worker(Worker):
         )
         bind_shared_down(model, self._rlk_worker)
         bind_rollout_fixed_routed_combine()
+        from vllm.distributed import get_tensor_model_parallel_world_size as _tp_size
+
+        tp_exact = _tp_size() > 1
+        if tp_exact:
+            from rl_engine.integrations.engines.rollout.vllm.routed_experts_tp import bind_tp_exact_routed_experts
+            from rl_engine.integrations.engines.rollout.vllm.shared_expert_tp import bind_tp_exact_shared_expert
+            from rl_engine.integrations.engines.rollout.vllm.tp_exact import (
+                assert_eager,
+                bind_exact_embedding,
+                bind_exact_moe_runner,
+                prepare_tp_collective,
+            )
+
+            assert_eager(self.vllm_config)
+            prepare_tp_collective(self.vllm_config)
+            if self._rlk_pp_rank == 0:
+                bind_exact_embedding(model.embed_tokens)
         for index in range(model.start_layer, model.end_layer):
             layer = model.layers[index]
             from rl_engine.integrations.engines.rollout.vllm.compressor_projection import (
@@ -84,6 +102,10 @@ class RLKVerlDSV4Worker(Worker):
                 layer.attn, max_workspace_bytes=int(os.environ.get("RLK_VERL_SPARSE_WORKSPACE_BYTES", 1 << 30))
             )
             bind_original_group_projection(layer.attn, self.model_config.model, index)
+            if tp_exact:
+                bind_tp_exact_shared_expert(layer.ffn, self.model_config.model, index)
+                bind_tp_exact_routed_experts(layer.ffn, self.model_config.model, index)
+                bind_exact_moe_runner(layer.ffn.experts)
             bind_rollout_decode(layer.attn)
         from rl_engine.integrations.engines.rollout.vllm.batch_order import bind_prefill_order
 
