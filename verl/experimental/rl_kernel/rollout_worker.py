@@ -32,6 +32,9 @@ class RLKVerlDSV4Worker(Worker):
         from rl_engine.integrations.engines.rollout.vllm.group_projection import (
             bind_original_group_projection,
         )
+        from rl_engine.integrations.engines.rollout.vllm.indexer_topk_det import (
+            bind_rollout_deterministic_indexer_topk,
+        )
         from rl_engine.integrations.engines.rollout.vllm.native_decode import bind_rollout_decode
         from rl_engine.integrations.engines.rollout.vllm.native_sparse import bind_rollout_sparse
         from rl_engine.integrations.engines.rollout.vllm.outputs import (
@@ -71,6 +74,7 @@ class RLKVerlDSV4Worker(Worker):
         )
         bind_shared_down(model, self._rlk_worker)
         bind_rollout_fixed_routed_combine()
+        bind_rollout_deterministic_indexer_topk()
         from vllm.distributed import get_tensor_model_parallel_world_size as _tp_size
 
         tp_exact = _tp_size() > 1
