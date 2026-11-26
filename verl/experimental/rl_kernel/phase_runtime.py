@@ -453,7 +453,8 @@ def actor_update(args):
     native_train_seconds = time.monotonic() - began
     if worker.engine.rlk_weight_version != args.version + 1:
         raise RuntimeError("native optimizer did not advance exactly one weight version")
-    if result is not None:
+    # Single writer (DP replica 0's output owner); other DP ranks would race on the same path.
+    if result is not None and is_score_writer(worker):
         torch.save(result, args.output / "native-train-output.pt")
     checkpoint = save_rank(worker.engine, args.next_checkpoint, provenance)
     manifest = export_policy(worker, args.output / f"policy-v{args.version + 1}.pt")

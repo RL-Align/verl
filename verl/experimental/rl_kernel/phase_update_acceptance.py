@@ -27,21 +27,28 @@ def verify(root):
     if len(steps) != 3 or [s["update"] for s in steps] != [1, 2, 3]:
         raise ValueError("exactly three consecutive updates are required")
     previous_payloads = {}
+    expected_world = None
     checked = []
     for step in steps:
         version = step["update"]
         update = root / f"update-{version}"
         checkpoint = root / f"checkpoint-v{version}"
         manifest = read(checkpoint / "manifest.json")
-        if (
-            manifest["world_size"] != 2
-            or manifest["weight_version"] != version
-            or {r["rank"] for r in manifest["ranks"]} != {0, 1}
-        ):
+        world = manifest["world_size"]
+        if world not in (2, 8) or (expected_world is not None and world != expected_world):
+            raise ValueError("actor world size must be 2 (PP2) or 8 (PP2 x DP4) and constant across updates")
+        expected_world = world
+        if manifest["weight_version"] != version or {r["rank"] for r in manifest["ranks"]} != set(range(world)):
             raise ValueError("complete actual PP2 checkpoint/version coverage is required")
         records = {r["rank"]: r for r in manifest["ranks"]}
-        for rank in range(2):
+        last_stage_ranks = set()
+        for rank in range(world):
             record = records[rank]
+            # Stage from the actual layer ownership: stage 0 owns original layer 0.
+            identity = read(update / f"actor-rank-{rank}.json")
+            first_stage = identity["original_layers"][0] == 0
+            if not first_stage:
+                last_stage_ranks.add(rank)
             file = checkpoint / record["file"]
             if file.name != f"rank-{rank}.pt":
                 raise ValueError("checkpoint rank filename differs")
@@ -59,7 +66,7 @@ def verify(root):
                 if digest(payload["models"][0][name]) != sha:
                     raise ValueError("actual saved model differs from native updated parameter: " + name)
             directions = {r["direction"] for r in native["pipeline_transfers"]}
-            required = {"forward_send", "backward_recv"} if rank == 0 else {"forward_recv", "backward_send"}
+            required = {"forward_send", "backward_recv"} if first_stage else {"forward_recv", "backward_send"}
             if not required.issubset(directions):
                 raise ValueError("actual PP forward/backward transfer is missing")
             if version > 1:
@@ -77,9 +84,14 @@ def verify(root):
         expected = Counter(tuple(c["prompt_ids"] + c["response_ids"]) for c in batch["samples"])
         observed = Counter()
         tokens = 0
-        paths = sorted(update.glob(f"update-forward-rank1-v{version}-micro*.pt"))
+        # Only last-stage ranks run the loss; each holds its own DP shard (its input_token_rows),
+        # so the union over files covers every training sample exactly once (DP1: one rank).
+        paths = sorted(update.glob(f"update-forward-rank*-v{version}-micro*.pt"))
         if not paths:
             raise ValueError("no retained actual update-forward scores")
+        writers = {int(p.name.split("-rank")[1].split("-")[0]) for p in paths}
+        if writers != last_stage_ranks:
+            raise ValueError("update-forward scores must come from exactly every last-stage rank")
         for path in paths:
             raw = torch.load(path, map_location="cpu", weights_only=True)
             if raw["weight_version"] != version - 1:

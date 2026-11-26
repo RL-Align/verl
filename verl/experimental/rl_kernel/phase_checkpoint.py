@@ -132,6 +132,30 @@ def restore(engine, payload, expected_provenance, *, restore_cuda=True):
     )
 
 
+def _listify(value):
+    if isinstance(value, dict):
+        return {str(k): _listify(v) for k, v in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_listify(v) for v in value]
+    return value
+
+
+def rank_coordinates(engine):
+    """This process's parallel coordinates (and expert placement, if recorded) as JSON-able values."""
+    from megatron.core import parallel_state as mpu
+
+    coords = dict(
+        pp_rank=mpu.get_pipeline_model_parallel_rank(),
+        dp_rank=mpu.get_data_parallel_rank(),
+        ep_rank=mpu.get_expert_model_parallel_rank(),
+    )
+    for model in engine._rlk_models:
+        placement = getattr(model, "_rlk_expert_placement", None)
+        if placement is not None:
+            coords.setdefault("expert_placement", []).append(_listify(placement))
+    return coords
+
+
 def save_rank(engine, directory, provenance):
     import torch.distributed as dist
 
@@ -154,6 +178,7 @@ def save_rank(engine, directory, provenance):
         bytes=path.stat().st_size,
         state_digest=state_digest(payload),
         weight_version=engine.rlk_weight_version,
+        **rank_coordinates(engine),
     )
     records = [None] * world
     dist.all_gather_object(records, record)
@@ -186,6 +211,11 @@ def load_rank(engine, directory, expected_provenance):
     if len(records) != world or {r["rank"] for r in records} != set(range(world)):
         raise ValueError("phase checkpoint missing or duplicate ranks")
     rec = next(r for r in records if r["rank"] == rank)
+    # Older manifests without coordinates stay loadable.
+    current = rank_coordinates(engine)
+    for key in ("pp_rank", "dp_rank", "ep_rank", "expert_placement"):
+        if key in rec and rec[key] != current.get(key):
+            raise ValueError(f"rank checkpoint {key} differs from this process")
     path = root / rec["file"]
     if path.name != f"rank-{rank}.pt" or not path.resolve().is_relative_to(root.resolve()):
         raise ValueError("rank checkpoint file ownership differs")

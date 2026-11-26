@@ -287,10 +287,16 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
                 gradient_records[name] = tensor_record(gradient)
         finite = all(bool(torch.isfinite(gradient).all()) for gradient in gradients)
         finite = finite and all(row["finite"] for rows in self._rlk_autograd_receipts.values() for row in rows)
+        local_received = {name for name, rows in self._rlk_autograd_receipts.items() if rows}
+        if self.get_data_parallel_size() > 1:
+            # A parameter may be used only by another replica's data; the DP-reduced gradient is nonzero everywhere.
+            gathered = [None] * self.get_data_parallel_size()
+            dist.all_gather_object(gathered, sorted(local_received), group=self.get_data_parallel_group())
+            received_anywhere = set().union(*gathered)
+        else:
+            received_anywhere = local_received
         missing_effective = [
-            name
-            for name, record in gradient_records.items()
-            if record["nonzero"] and not self._rlk_autograd_receipts.get(name)
+            name for name, record in gradient_records.items() if record["nonzero"] and name not in received_anywhere
         ]
         if missing_effective:
             raise RuntimeError(f"effective optimizer gradients lack actual autograd receipt: {missing_effective}")

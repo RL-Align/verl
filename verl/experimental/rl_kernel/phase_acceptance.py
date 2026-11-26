@@ -26,17 +26,26 @@ def tensor_sha(value):
 
 def verify(args):
     profile = read(args.profile)
-    if profile["id"] not in ("N1", "N2", "N3", "N4"):
-        raise ValueError("N5 requires separately qualified EP evidence and must not bypass its gate")
     target = profile["actor"]
-    if (target["pp"], target["tp"], target["ep"], target["etp"], target["dp"]) != (2, 1, 1, 1, 1):
+    layout = (target["pp"], target["tp"], target["ep"], target["etp"], target["dp"])
+    if layout not in ((2, 1, 1, 1, 1), (2, 1, 4, 1, 4)):
         raise ValueError("revised primary actor topology differs")
+    n, dp, ep = target["gpus"], target["dp"], target["ep"]
+    if n != 2 * dp:
+        raise ValueError("actor GPU count differs from PP2 x DP")
     alloc = read(args.allocation)
     expected_pci = [row["pci_bus_id"].lower() for row in alloc]
-    actors = [read(args.actor / f"actor-rank-{rank}.json") for rank in range(2)]
-    if [r["rank"] for r in actors] != [0, 1] or [r["original_layers"] for r in actors] != [[0, 1, 2, 3], [4, 5, 6]]:
+    actors = [read(args.actor / f"actor-rank-{rank}.json") for rank in range(n)]
+    # Megatron default order: PP outermost, so the first n//2 ranks are stage 0.
+    expected_layers = [[0, 1, 2, 3] if rank < n // 2 else [4, 5, 6] for rank in range(n)]
+    if [r["rank"] for r in actors] != list(range(n)) or [r["original_layers"] for r in actors] != expected_layers:
         raise ValueError("actual seven-layer actor PP ownership differs")
-    if [r["pci_bus_id"].lower() for r in actors] != expected_pci[:2]:
+    for rank, r in enumerate(actors):
+        expected_ids = dict(dp_rank=rank % dp, dp_size=dp, ep_size=ep, ep_rank=rank % dp if ep > 1 else 0)
+        for key, value in expected_ids.items():
+            if key in r and r[key] != value:
+                raise ValueError(f"actual actor rank {rank} {key} differs")
+    if [r["pci_bus_id"].lower() for r in actors] != expected_pci[:n]:
         raise ValueError("actual actor GPU PCI placement differs")
     rollout = read(args.rollout / "rollout-ranks.json")
     tp = profile["rollout"]["tp"]
@@ -138,7 +147,7 @@ def verify(args):
         scores,
         scope="fixed-weight scoring only; not GRPO or target-load acceptance",
         rank_and_weight_readback="PASS",
-        actual_actor_ranks=2,
+        actual_actor_ranks=n,
         actual_rollout_ranks=tp,
         negative_control=negative,
         policy_state_digest=state_digest(payload["weights"]),
