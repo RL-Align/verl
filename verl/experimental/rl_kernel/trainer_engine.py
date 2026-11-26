@@ -103,12 +103,13 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
             bind_actor_operators(model, sparse_workspace_bytes=self.engine_config.rlk_sparse_workspace_bytes)
         from examples.operators.dsv4_4l.distributed_evidence import PipelineBoundaryEvidence
 
-        self._rlk_boundary = PipelineBoundaryEvidence(self._rlk_models[0], dp_rank=0)
+        self._rlk_boundary = PipelineBoundaryEvidence(self._rlk_models[0], dp_rank=self.get_data_parallel_rank())
         self._rlk_previous_optimizer = None
         if self.engine_config.rlk_evidence_dir:
             import os
 
             import torch.distributed as dist
+            from megatron.core import parallel_state as mpu
             from rl_engine.integrations.common.device_identity import hip_device_identity
 
             root = Path(self.engine_config.rlk_evidence_dir)
@@ -117,6 +118,8 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
                 json.dumps(
                     dict(
                         rank=dist.get_rank(),
+                        dp_rank=self.get_data_parallel_rank(),
+                        ep_rank=mpu.get_expert_model_parallel_rank(),
                         actual_model_class=type(self._rlk_models[0]).__module__
                         + "."
                         + type(self._rlk_models[0]).__qualname__,
@@ -316,6 +319,7 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
                     dict(
                         weight_version=self.rlk_weight_version,
                         rank=dist.get_rank(),
+                        dp_rank=self.get_data_parallel_rank(),
                         optimizer_before=optimizer_before,
                         optimizer_after=optimizer_after,
                         optimizer_continuity=True,

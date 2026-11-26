@@ -25,6 +25,7 @@ from rl_engine.integrations.orchestrators.verl.native_imports import install_nat
 install_native_import_adapters()
 
 import torch
+from verl.experimental.rl_kernel.dp_shard import gather_in_order, require_even, shard_cases, shard_indices
 
 
 def write(path, value):
@@ -133,6 +134,61 @@ def make_data(cases, *, microbatch=1):
     return data
 
 
+def _score_rows(result, cases):
+    """Response-token FP32 scores per case on an output-owning rank, else None."""
+    if result is None:
+        return None
+    return [
+        row[len(case["prompt_ids"]) - 1 : len(case["prompt_ids"]) + len(case["response_ids"]) - 1]
+        .detach()
+        .cpu()
+        .clone()
+        for row, case in zip(result["log_probs"].unbind(), cases, strict=True)
+    ]
+
+
+def dp_coordinates(worker):
+    """(dp_rank, dp_size, owns_outputs) of this rank in the actor engine."""
+    engine = worker.engine
+    return engine.get_data_parallel_rank(), engine.get_data_parallel_size(), engine.is_mp_src_rank_with_outputs()
+
+
+def is_score_writer(worker):
+    """Single writer of score files: the output-owning rank of DP replica 0.
+
+    With PP2/DP1 this is the last pipeline rank, the only rank that wrote scores before DP sharding.
+    """
+    dp_rank, _, owner = dp_coordinates(worker)
+    return owner and dp_rank == 0
+
+
+def score_batch(worker, batch_cases):
+    """Score one logical batch across DP replicas; every rank returns all scores in case order.
+
+    Each DP rank scores its padded shard as one microbatch, so all DP ranks run the
+    same number of forward calls (required when the MoE all-to-all spans DP). With
+    DP1 this is exactly ``infer_batch(make_data(batch_cases, microbatch=len(batch_cases)))``.
+    """
+    dp_rank, dp_size, owner = dp_coordinates(worker)
+    local, _ = shard_cases(batch_cases, dp_rank, dp_size)
+    rows = _score_rows(worker.infer_batch(make_data(local, microbatch=len(local))), local)
+    return gather_in_order(rows, len(batch_cases), dp_rank, dp_size, owner)
+
+
+def score_single_rounds(worker, cases):
+    """Score each case alone (microbatch 1) in DP-sharded rounds; all ranks get all scores in order.
+
+    Every round each DP rank scores one case, or a padding duplicate whose output is dropped.
+    """
+    dp_rank, dp_size, owner = dp_coordinates(worker)
+    local, _ = shard_cases(cases, dp_rank, dp_size)
+    rows = []
+    for case in local:
+        scored = _score_rows(worker.infer_batch(make_data([case])), [case])
+        rows.append(scored[0] if scored is not None else None)
+    return gather_in_order(rows if owner else [], len(cases), dp_rank, dp_size, owner)
+
+
 def build_actor(args, *, training=False):
     import torch.distributed as dist
     from rl_engine.integrations.common.device_identity import hip_device_identity
@@ -144,13 +200,17 @@ def build_actor(args, *, training=False):
     from verl.workers.engine_workers import TrainingWorker
 
     profile = json.loads(args.profile.read_text())
-    if profile["id"] not in ("N1", "N2", "N3", "N4"):
-        raise ValueError("only the revised primary N1-N4 actor profiles may execute here")
+    if profile["id"] not in ("N1", "N2", "N3", "N4", "N5"):
+        raise ValueError("only the revised primary N1-N5 actor profiles may execute here")
     target = profile["actor"]
     if target["tp"] != 1 or target["etp"] != 1 or target["cp"] != 1:
         raise ValueError("native DSV4 actor TP1/ETP1/CP1 restrictions are retained")
-    if target["ep"] != 1:
-        raise ValueError("N5 EP4 is a separately gated implementation; do not substitute EP1")
+    if target["pp"] != 2 or target["gpus"] != target["pp"] * target["dp"]:
+        raise ValueError("native DSV4 actor requires PP2 with world = PP x dense DP")
+    if target["ep"] not in (1, 4):
+        raise ValueError("native DSV4 actor supports EP1 or EP4 only")
+    if target["ep"] == 4 and (target["dp"] != 4 or target["expert_dp"] != 1):
+        raise ValueError("EP4 requires dense DP4 and expert DP1 (EP group = the DP ranks of a PP stage)")
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
     if dist.get_world_size() != target["gpus"]:
@@ -168,7 +228,7 @@ def build_actor(args, *, training=False):
             tensor_model_parallel_size=1,
             expert_tensor_parallel_size=1,
             pipeline_model_parallel_size=2,
-            expert_model_parallel_size=1,
+            expert_model_parallel_size=target["ep"],
             context_parallel_size=1,
             sequence_parallel=False,
             param_offload=False,
@@ -192,11 +252,17 @@ def build_actor(args, *, training=False):
     )
     worker = TrainingWorker(cfg)
     worker.reset()
+    from megatron.core import parallel_state as mpu
+
     identity = dict(
         engine="verl.TrainingWorker.infer_batch",
         weight_version=args.version,
         role="actor",
         rank=dist.get_rank(),
+        dp_rank=worker.engine.get_data_parallel_rank(),
+        dp_size=worker.engine.get_data_parallel_size(),
+        ep_rank=mpu.get_expert_model_parallel_rank(),
+        ep_size=mpu.get_expert_model_parallel_world_size(),
         pid=os.getpid(),
         topology=target,
         original_layers=list(worker.engine._rlk_models[0]._rlk_checkpoint_stage.layer_ids),
@@ -233,16 +299,11 @@ def actor_score(args):
                             "actor",
                         )
                     )
-            result = worker.infer_batch(make_data(batch_cases, microbatch=len(batch_cases)))
-        if result is not None:
-            values = result["log_probs"]
-            for row, case in zip(values.unbind(), batch_cases, strict=True):
-                scores.append(
-                    row[len(case["prompt_ids"]) - 1 : len(case["prompt_ids"]) + len(case["response_ids"]) - 1]
-                )
-            batches.append(
-                dict(batch_id=batch_id, samples=[c["id"] for c in batch_cases], seconds=time.monotonic() - start)
-            )
+            # Every rank receives all scores of the batch in original case order.
+            scores.extend(score_batch(worker, batch_cases))
+        batches.append(
+            dict(batch_id=batch_id, samples=[c["id"] for c in batch_cases], seconds=time.monotonic() - start)
+        )
     # Native PP export gathers original names/state; quantized base remains in the pinned source model.
     tensors, _ = worker.engine.get_per_tensor_param(base_sync_done=True)
     weights = {name: tensor.detach().cpu().clone() for name, tensor in tensors}
@@ -250,7 +311,7 @@ def actor_score(args):
     if dist.get_rank() == 0:
         torch.save(dict(weight_version=0, weights=weights, manifest=manifest), args.output / "policy-v0.pt")
         write(args.output / "policy-v0-manifest.json", manifest)
-    if scores:
+    if is_score_writer(worker):
         save_scores(args.output, cases, scores, identity, suite_hash, args.snapshot_sha256)
         write(args.output / "actor-batches.json", batches)
     dist.barrier()
@@ -308,21 +369,12 @@ def actor_update(args):
     elif args.resume:
         raise ValueError("initial actor must not load an unrelated update history")
     # Always recompute independently on the actual native actor before PPO.
-    actor_scores = []
     began = time.monotonic()
-    for case in cases:
-        result = worker.infer_batch(make_data([case]))
-        if result is not None:
-            row = result["log_probs"].unbind()[0]
-            actor_scores.append(
-                row[len(case["prompt_ids"]) - 1 : len(case["prompt_ids"]) + len(case["response_ids"]) - 1]
-                .detach()
-                .cpu()
-            )
-    observed = [actor_scores if actor_scores else None]
-    # PP2/TP1/DP1's output source is the last pipeline rank.
-    dist.broadcast_object_list(observed, src=dist.get_world_size() - 1)
-    actor_scores = observed[0]
+    dp_rank, dp_size, _ = dp_coordinates(worker)
+    # Training never pads (a duplicate would add loss); GRPO batches are 4 or 128.
+    require_even(len(cases), dp_size)
+    # DP-sharded lockstep rounds; every rank ends with all actor scores in case order.
+    actor_scores = score_single_rounds(worker, cases)
     if len(actor_scores) != len(cases):
         raise RuntimeError("actor scoring did not cover every training sample")
     comparisons = []
@@ -365,17 +417,22 @@ def actor_update(args):
     )
     if not bool(torch.isfinite(advantages).all()) or not bool(torch.count_nonzero(advantages)):
         raise RuntimeError("no effective GRPO update: native advantages are zero or nonfinite")
-    data = make_data(cases)
+    # Advantages above are global and identical on every rank; train only on this DP rank's shard.
+    mine = shard_indices(len(cases), dp_rank, dp_size)
+    local_cases = [cases[i] for i in mine]
+    data = make_data(local_cases)
     nested = lambda rows: torch.nested.as_nested_tensor(rows, layout=torch.jagged)
-    data["prompts"] = nested([torch.tensor(c["prompt_ids"], dtype=torch.int64) for c in cases])
-    data["responses"] = nested([torch.tensor(c["response_ids"], dtype=torch.int64) for c in cases])
-    data["response_mask"] = nested([torch.ones(n) for n in lengths])
-    data["old_log_probs"] = nested(actor_scores)
-    data["advantages"] = nested([advantages[i, :n] for i, n in enumerate(lengths)])
+    data["prompts"] = nested([torch.tensor(c["prompt_ids"], dtype=torch.int64) for c in local_cases])
+    data["responses"] = nested([torch.tensor(c["response_ids"], dtype=torch.int64) for c in local_cases])
+    data["response_mask"] = nested([torch.ones(lengths[i]) for i in mine])
+    data["old_log_probs"] = nested([actor_scores[i] for i in mine])
+    data["advantages"] = nested([advantages[i, : lengths[i]] for i in mine])
+    # batch_num_tokens is the GLOBAL response-token count. forward_backward_batch recomputes the same
+    # value by all-reducing the local loss_mask sum over the DP group, so this agrees with it.
     tu.assign_non_tensor(
         data,
         batch_num_tokens=sum(lengths),
-        dp_size=1,
+        dp_size=dp_size,
         global_batch_size=len(cases),
         update_lr_scheduler=True,
         compute_loss=True,
@@ -445,13 +502,8 @@ def actor_audit(args):
             raise ValueError("fresh generation and logical suite differ")
     scores = []
     for _, batch_cases in groups(cases):
-        result = worker.infer_batch(make_data(batch_cases, microbatch=len(batch_cases)))
-        if result is not None:
-            for row, case in zip(result["log_probs"].unbind(), batch_cases, strict=True):
-                scores.append(
-                    row[len(case["prompt_ids"]) - 1 : len(case["prompt_ids"]) + len(case["response_ids"]) - 1]
-                )
-    if scores:
+        scores.extend(score_batch(worker, batch_cases))
+    if is_score_writer(worker):
         save_scores(args.output, cases, scores, identity, suite_hash, args.snapshot_sha256)
     if state_digest(worker.engine.optimizer.state_dict()) != before:
         raise RuntimeError("audit changed optimizer history")
