@@ -75,6 +75,9 @@ class RLKVerlDSV4Worker(Worker):
         bind_shared_down(model, self._rlk_worker)
         bind_rollout_fixed_routed_combine()
         bind_rollout_deterministic_indexer_topk()
+        from rl_engine.backends.rocm.attention.compressor_schedule import pin_c128_compressor_schedule
+
+        pin_c128_compressor_schedule()
         from vllm.distributed import get_tensor_model_parallel_world_size as _tp_size
 
         tp_exact = _tp_size() > 1
