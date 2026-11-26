@@ -40,6 +40,7 @@ class RLKVerlDSV4Worker(Worker):
         from rl_engine.integrations.engines.rollout.vllm.router_projection import (
             bind_rollout_router_projection,
         )
+        from rl_engine.integrations.engines.rollout.vllm.routed_combine import bind_rollout_fixed_routed_combine
         from rl_engine.integrations.engines.rollout.vllm.shared_down import bind_shared_down
         from rl_engine.integrations.orchestrators.verl.mhc import bind_mhc_worker
         from vllm.distributed import get_pp_group
@@ -68,6 +69,7 @@ class RLKVerlDSV4Worker(Worker):
             version=phase_version,
         )
         bind_shared_down(model, self._rlk_worker)
+        bind_rollout_fixed_routed_combine()
         for index in range(model.start_layer, model.end_layer):
             layer = model.layers[index]
             from rl_engine.integrations.engines.rollout.vllm.compressor_projection import (
