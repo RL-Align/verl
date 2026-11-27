@@ -226,6 +226,10 @@ def build_actor(args, *, training=False):
             rlk_require_update_forward_parity=training,
             # Sparse attention backward needs ~13.2 GB at 8,192 queries (1024+7168).
             rlk_sparse_workspace_bytes=16 << 30,
+            # One canonical parameter-gradient reduction per microbatch, accumulated by DDP in
+            # fixed microbatch order: a step-wide reduction keeps every saved row of a
+            # 128 x 8k-token batch on the device (hundreds of GiB).
+            rlk_canonical_scope="microbatch",
             tensor_model_parallel_size=1,
             expert_tensor_parallel_size=1,
             pipeline_model_parallel_size=2,
