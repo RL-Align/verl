@@ -3,6 +3,7 @@
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from uuid import uuid4
 
@@ -52,8 +53,9 @@ def preflight(config):
     (challenge / "challenge").write_text(nonce)
     model = Path(config.actor_rollout_ref.model.path)
     metadata = json.loads((model / "config.json").read_text())
-    if metadata.get("num_hidden_layers") != 4:
-        raise ValueError("this integration still requires the four-layer checkpoint")
+    split = [int(x) for x in os.environ.get("RLK_DSV4_PP_SPLIT", "3,1").split(",")]
+    if metadata.get("num_hidden_layers") != sum(split):
+        raise ValueError(f"checkpoint layers do not match RLK_DSV4_PP_SPLIT={split}")
     paths = [str(model / name) for name in ("config.json", "tokenizer.json")]
     weights = sorted(model.glob("*.safetensors"))
     if not weights:

@@ -14,6 +14,7 @@
 """Quiesced PP2 weight sync for the ordinary synchronous verl trainer."""
 
 import asyncio
+import os
 import json
 from pathlib import Path
 from uuid import uuid4
@@ -56,7 +57,7 @@ class RLKPolicySync:
         )
         path = self.root / f"policy-{uuid4().hex}.pt"
         exports = self.actor_wg.rlk_export_policy(str(path))
-        if not exports or len(exports) != 2:
+        if not exports or len(exports) != len(os.environ.get("RLK_DSV4_PP_SPLIT", "3,1").split(",")):
             raise RuntimeError("expected both actor PP stages to export")
         first = exports[0]
         if any(item != first for item in exports):

@@ -6,6 +6,28 @@ import json
 from pathlib import Path
 
 
+def pp_size():
+    """Number of pipeline stages, from RLK_DSV4_PP_SPLIT (default "3,1")."""
+    import os
+
+    return len(os.environ.get("RLK_DSV4_PP_SPLIT", "3,1").split(","))
+
+
+def rollout_pp():
+    """Rollout pipeline stages, from RLK_ROLLOUT_PP_SPLIT (default: same as the actor)."""
+    import os
+
+    split = os.environ.get("RLK_ROLLOUT_PP_SPLIT") or os.environ.get("RLK_DSV4_PP_SPLIT", "3,1")
+    return len(split.split(","))
+
+
+def rollout_tp():
+    """Rollout tensor-parallel size, from RLK_ROLLOUT_TP (default 1)."""
+    import os
+
+    return int(os.environ.get("RLK_ROLLOUT_TP", "1"))
+
+
 def topology(config):
     """Validate explicit placement without enabling new numerical layouts."""
     rlk = config.get("rlk", {})
@@ -16,7 +38,7 @@ def topology(config):
     rollout_ips = list(rollout.get("rlk_node_ips", []))
     for role, settings, ips in [("actor", trainer, actor_ips), ("rollout", rollout, rollout_ips)]:
         nodes, gpus = settings["nnodes"], settings["n_gpus_per_node"]
-        if type(nodes) is not int or type(gpus) is not int or (nodes, gpus) not in [(1, 2), (2, 1)]:
+        if type(nodes) is not int or type(gpus) is not int or nodes * gpus != (rollout_pp() * rollout_tp() if role == "rollout" else pp_size()):
             raise ValueError(f"{role}: only PP2/DP1 on 1x2 or 2x1 GPUs is implemented")
         if enabled:
             if len(ips) != nodes or len(set(ips)) != nodes:
@@ -61,7 +83,8 @@ def verify_placement(plan, actor_records, rollout_records, nodes):
     all_devices = set()
     actual = {}
     for role, records in [("actor", actor_records), ("rollout", rollout_records)]:
-        if len(records) != 2 or {r["rank"] for r in records} != {0, 1}:
+        stages = rollout_pp() if role == "rollout" else pp_size()
+        if len(records) != stages or {r["rank"] for r in records} != set(range(stages)):
             raise RuntimeError(f"{role}: missing or duplicate PP rank")
         counts = {}
         for record in records:
