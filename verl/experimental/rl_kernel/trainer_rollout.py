@@ -35,7 +35,7 @@ class RLKTrainerVLLMServer(RLKPipelineVLLMHttpServer):
         os.environ["RLK_NODE_ID"] = ray.get_runtime_context().get_node_id()
         os.environ["RLK_SYNC_DIR"] = str(kwargs["config"].rlk_sync_dir or "/outputs/policy-sync")
         os.environ.update(
-            VLLM_PP_LAYER_PARTITION="3,1",
+            VLLM_PP_LAYER_PARTITION=os.environ.get("RLK_ROLLOUT_PP_SPLIT") or os.environ.get("RLK_DSV4_PP_SPLIT", "3,1"),
             VLLM_ROCM_USE_AITER="1",
             VLLM_ENABLE_V1_MULTIPROCESSING="1",
         )

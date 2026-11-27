@@ -222,7 +222,7 @@ def stress_current_version(trainer, repeats):
             label = f"stress-{iteration:05d}-{group}-" + "".join(order)
             reply = ray.get(server.rlk_score_sequences.remote(selected, f"v3-{label}"))
             if (
-                len(reply["stages"]) != 2
+                len(reply["stages"]) != len(pids)
                 or len(reply["scores"]) != len(selected)
                 or reply["global_steps"] != 3
                 or any(
@@ -269,12 +269,12 @@ def stress_current_version(trainer, repeats):
     path = root / "policy-v3-stress-readback.pt"
     exports = trainer.actor_rollout_wg.rlk_export_policy(str(path))
     (root / "stress-v3-actor-readback.json").write_text(json.dumps(exports, indent=2))
-    if len(exports) != 2 or any(e["weight_version"] != 3 or e["manifest"] != expected for e in exports):
+    if not exports or any(e["weight_version"] != 3 or e["manifest"] != expected for e in exports):
         raise RuntimeError("actual actor parameters changed during inference stress")
     readbacks = ray.get(server.rlk_verify_current_policy.remote(str(path)))
     (root / "stress-v3-rollout-readback.json").write_text(json.dumps(readbacks, indent=2))
     covered = set()
-    if len(readbacks) != 2:
+    if len(readbacks) != len(pids):
         raise RuntimeError("final stress readback requires both actual PP stages")
     for ack in readbacks:
         if worker_key(ack) != pids[ack["pipeline_stage"]] or ack["weight_version"] != 3:

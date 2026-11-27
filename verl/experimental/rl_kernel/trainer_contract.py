@@ -17,7 +17,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from .cluster_contract import topology, worker_key
+from .cluster_contract import pp_size, rollout_pp, rollout_tp, topology, worker_key
 
 VERL_REVISION = "cc35929bf8eedf5f3eb7c4ace3441dfd9f6d4c0e"
 
@@ -52,7 +52,7 @@ def validate_trainer_config(config):
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu": 1,
         "actor_rollout_ref.actor.ppo_epochs": 1,
         "actor_rollout_ref.actor.megatron.strategy": "rlk_verl_megatron",
-        "actor_rollout_ref.actor.megatron.pipeline_model_parallel_size": 2,
+        "actor_rollout_ref.actor.megatron.pipeline_model_parallel_size": pp_size(),
         "actor_rollout_ref.actor.megatron.tensor_model_parallel_size": 1,
         "actor_rollout_ref.actor.megatron.expert_model_parallel_size": 1,
         "actor_rollout_ref.actor.megatron.context_parallel_size": 1,
@@ -76,10 +76,14 @@ def validate_trainer_config(config):
         "actor_rollout_ref.rollout.checkpoint_engine.backend": "naive",
     }
     errors = [f"{key} must be {expected!r}" for key, expected in required.items() if value(config, key) != expected]
-    rollout_pp = value(config, "actor_rollout_ref.rollout.pipeline_model_parallel_size")
-    rollout_tp = value(config, "actor_rollout_ref.rollout.tensor_model_parallel_size")
-    if (rollout_pp, rollout_tp) not in {(2, 1), (1, 1), (1, 2), (1, 4), (1, 8)}:
-        errors.append("rollout (PP, TP) must be (2, 1) or (1, TP in 1,2,4,8)")
+    cfg_rollout_pp = value(config, "actor_rollout_ref.rollout.pipeline_model_parallel_size")
+    cfg_rollout_tp = value(config, "actor_rollout_ref.rollout.tensor_model_parallel_size")
+    if not (
+        type(cfg_rollout_pp) is int
+        and cfg_rollout_pp >= 1
+        and (cfg_rollout_tp == 1 or (cfg_rollout_pp == 1 and cfg_rollout_tp in (1, 2, 4, 8)))
+    ):
+        errors.append("rollout (PP, TP) must be (PP>=1, 1) or (1, TP in 1,2,4,8)")
     for key in (
         "actor_rollout_ref.model.mtp.enable",
         "actor_rollout_ref.model.lora.rank",
@@ -129,10 +133,10 @@ def logical_cases(input_ids):
 
 def validate_stage_acks(acks, manifest, version, previous_pids=None):
     """Every original tensor must be read back once on the two live stages."""
-    if len(acks) != 2 or {ack["pipeline_stage"] for ack in acks} != {0, 1}:
+    if len(acks) != rollout_pp() or {ack["pipeline_stage"] for ack in acks} != set(range(rollout_pp())):
         raise RuntimeError("weight sync requires exactly two different PP stage acknowledgments")
     pids = {ack["pipeline_stage"]: worker_key(ack) for ack in acks}
-    if len(set(pids.values())) != 2 or (previous_pids is not None and pids != previous_pids):
+    if len(set(pids.values())) != rollout_pp() or (previous_pids is not None and pids != previous_pids):
         raise RuntimeError("rollout worker PIDs changed across the continuous update")
     checked = {}
     for ack in acks:
