@@ -224,7 +224,8 @@ def build_actor(args, *, training=False):
             rlk_allow_right_padding=True,
             rlk_evidence_dir=str(args.output),
             rlk_require_update_forward_parity=training,
-            rlk_sparse_workspace_bytes=4 << 30,
+            # Sparse attention backward needs ~13.2 GB at 8,192 queries (1024+7168).
+            rlk_sparse_workspace_bytes=16 << 30,
             tensor_model_parallel_size=1,
             expert_tensor_parallel_size=1,
             pipeline_model_parallel_size=2,
