@@ -6,7 +6,7 @@ from types import SimpleNamespace as NS
 import pytest
 import torch
 
-from verl.experimental.rl_kernel.phase_checkpoint import capture, restore, state_digest
+from verl.experimental.rl_kernel.phase_checkpoint import capture, restore, section_digests, state_digest
 
 
 def engine():
@@ -52,6 +52,32 @@ def test_three_actual_adam_updates_survive_process_style_reconstruction_exactly(
         assert state_digest(fresh.optimizer.state_dict()) == state_digest(uninterrupted.optimizer.state_dict())
         assert state_digest(fresh.lr_scheduler.state_dict()) == state_digest(uninterrupted.lr_scheduler.state_dict())
         resumed = fresh
+
+
+def test_section_digests_exclude_provenance_and_process_identity():
+    torch.manual_seed(3)
+    first, second = engine(), engine()
+    second._rlk_models[0].load_state_dict(first._rlk_models[0].state_dict())
+    step(first)
+    step(second)
+    # Same training state, different group and process evidence (ids, data pointers).
+    first._rlk_previous_optimizer = dict(pid=1, optimizer_id=id(first.optimizer), data_ptr=11)
+    second._rlk_previous_optimizer = dict(pid=2, optimizer_id=id(second.optimizer), data_ptr=22)
+    a = capture(first, dict(group="N1", source="test"), capture_cuda=False)
+    b = capture(second, dict(group="N2", source="test"), capture_cuda=False)
+    b["rng"] = a["rng"]  # both groups restore the same seeded RNG; this test isolates metadata
+    assert state_digest(a) != state_digest(b)
+    assert section_digests(a) == section_digests(b)
+    assert set(section_digests(a)) == {
+        "model_state_digest",
+        "optimizer_state_digest",
+        "scheduler_state_digest",
+        "rng_state_digest",
+    }
+    step(second)
+    changed = section_digests(capture(second, dict(group="N2", source="test"), capture_cuda=False))
+    assert changed["model_state_digest"] != section_digests(a)["model_state_digest"]
+    assert changed["optimizer_state_digest"] != section_digests(a)["optimizer_state_digest"]
 
 
 def test_recovery_requires_the_same_version_source_and_topology():

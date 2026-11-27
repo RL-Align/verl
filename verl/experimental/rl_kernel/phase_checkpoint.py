@@ -66,6 +66,20 @@ def state_digest(value):
     return h.hexdigest()
 
 
+def section_digests(payload):
+    """Digests of the training state alone, comparable across processes and groups.
+
+    ``state_digest(payload)`` also covers provenance and optimizer evidence (pid,
+    object ids, data pointers), so it identifies a file, not a trajectory.
+    """
+    return dict(
+        model_state_digest=state_digest(payload["models"]),
+        optimizer_state_digest=state_digest(payload["optimizer"]),
+        scheduler_state_digest=state_digest(payload["scheduler"]),
+        rng_state_digest=state_digest(payload["rng"]),
+    )
+
+
 def capture(engine, provenance, *, capture_cuda=True):
     if engine.optimizer is None or engine.lr_scheduler is None:
         raise ValueError("phase recovery requires initialized optimizer and scheduler")
@@ -177,6 +191,7 @@ def save_rank(engine, directory, provenance):
         sha256=digest,
         bytes=path.stat().st_size,
         state_digest=state_digest(payload),
+        **section_digests(payload),
         weight_version=engine.rlk_weight_version,
         **rank_coordinates(engine),
     )
