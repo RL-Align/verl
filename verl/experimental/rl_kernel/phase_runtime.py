@@ -405,12 +405,18 @@ def actor_update(args):
     advantages, _ = compute_grpo_outcome_advantage(
         rewards, response_mask, np.array([c["group_id"] for c in cases]), norm_adv_by_std_in_grpo=True
     )
+    sample_advantages = torch.stack([advantages[i, lengths[i] - 1] for i in range(len(cases))])  # one scalar per sample
     write(
         args.output / f"reward-advantage-rank-{dist.get_rank()}.json",
         dict(
             raw_rewards=[c["raw_reward"] for c in cases],
             group_ids=[c["group_id"] for c in cases],
             nonzero_advantages=int(torch.count_nonzero(advantages)),
+            advantage_samples=len(cases),
+            advantages=[float(a) for a in sample_advantages],
+            advantage_mean_abs=float(sample_advantages.abs().mean()),
+            advantage_std=float(sample_advantages.std()) if len(cases) > 1 else 0.0,
+            advantage_nonzero_samples=int(torch.count_nonzero(sample_advantages)),
             finite=bool(torch.isfinite(advantages).all()),
             advantage_source="verl.trainer.ppo.core_algos.compute_grpo_outcome_advantage",
         ),
@@ -619,6 +625,7 @@ async def rollout_phase(args):
             if request is None:
                 raise ValueError("native generation needs a locked prompt/reward request")
             from examples.operators.dsv4_4l.copy_task import compute_score as copy_score
+            from examples.operators.dsv4_4l.long_context_copy import compute_score as lcc_score
 
             from verl.utils.reward_score import default_compute_score
 
@@ -650,15 +657,24 @@ async def rollout_phase(args):
                 if len(values) != len(response):
                     raise RuntimeError("native sampled logprob count differs from response")
                 text = server.model_config.tokenizer.decode(response, skip_special_tokens=True)
-                scoring = copy_score if prompt["data_source"] == "rlk/exact-copy" else default_compute_score
+                if prompt["data_source"] == "rlk/exact-copy":
+                    scoring = copy_score
+                elif prompt["data_source"] == "rlk/long-context-copy":
+                    scoring = lcc_score
+                else:
+                    scoring = default_compute_score
                 source = prompt["data_source"]
                 if source.startswith("BytedTsinghua-SIA/"):
                     source = "math_dapo"
+                extra_info = prompt.get("extra_info", {})
+                if source == "rlk/long-context-copy":
+                    # Token-level reward: score the actual generated ids (target_ids/eos_token_id are in the request).
+                    extra_info = dict(extra_info, response_ids=response, max_tokens=cap)
                 reward = scoring(
                     data_source=source,
                     solution_str=text,
                     ground_truth=prompt["ground_truth"],
-                    extra_info=prompt.get("extra_info", {}),
+                    extra_info=extra_info,
                 )
                 score = reward["score"] if isinstance(reward, dict) else reward
                 generated.append(
@@ -673,6 +689,7 @@ async def rollout_phase(args):
                         reward_evidence=reward,
                         reward_source=scoring.__module__ + "." + scoring.__name__,
                         reward_source_file=inspect.getfile(scoring),
+                        reward_source_sha256=hashlib.sha256(Path(inspect.getfile(scoring)).read_bytes()).hexdigest(),
                         position_ids=list(range(len(prompt["prompt_ids"]) + len(response))),
                         mask="full-causal-unpadded-all-response-tokens",
                     )
