@@ -19,6 +19,8 @@ from contextlib import ExitStack
 import torch
 from vllm.v1.worker.gpu_worker import Worker
 
+from verl.utils.device import get_device_name, get_torch_device
+
 
 class RLKVerlDSV4Worker(Worker):
     def load_model(self, **kwargs):
@@ -41,10 +43,10 @@ class RLKVerlDSV4Worker(Worker):
             bind_output_head,
             selected_raw_logprobs,
         )
+        from rl_engine.integrations.engines.rollout.vllm.routed_combine import bind_rollout_fixed_routed_combine
         from rl_engine.integrations.engines.rollout.vllm.router_projection import (
             bind_rollout_router_projection,
         )
-        from rl_engine.integrations.engines.rollout.vllm.routed_combine import bind_rollout_fixed_routed_combine
         from rl_engine.integrations.engines.rollout.vllm.shared_down import bind_shared_down
         from rl_engine.integrations.orchestrators.verl.mhc import bind_mhc_worker
         from vllm.distributed import get_pp_group
@@ -239,7 +241,7 @@ class RLKVerlDSV4Worker(Worker):
         )
 
         wrapper = self.model_runner.get_model()
-        payload = pipeline_stage_payload(wrapper, torch.load(path, map_location="cuda", weights_only=True))
+        payload = pipeline_stage_payload(wrapper, torch.load(path, map_location=get_device_name(), weights_only=True))
         worker = self._rlk_worker
         version = payload["weight_version"]
         if version < worker.version or (version == worker.version and version != 0):
@@ -253,7 +255,7 @@ class RLKVerlDSV4Worker(Worker):
                     readback_original_tensor(wrapper, name, tensor)[0] for name, tensor in payload["weights"].items()
                 }
             else:
-                stack.enter_context(worker.updating(version, torch.cuda.synchronize))
+                stack.enter_context(worker.updating(version, get_torch_device().synchronize))
                 loaded = wrapper.load_weights(payload["weights"].items())
             checked = verify_loaded_update(wrapper, payload, loaded)
         return dict(
@@ -293,7 +295,7 @@ class RLKVerlDSV4Worker(Worker):
         )
 
         wrapper = self.model_runner.get_model()
-        payload = pipeline_stage_payload(wrapper, torch.load(path, map_location="cuda", weights_only=True))
+        payload = pipeline_stage_payload(wrapper, torch.load(path, map_location=get_device_name(), weights_only=True))
         if payload["weight_version"] != self._rlk_worker.version:
             raise RuntimeError("readback requested a stale policy")
         with self._rlk_worker.request(payload["weight_version"]):
