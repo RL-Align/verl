@@ -24,13 +24,18 @@ from verl.utils.device import get_device_name, get_torch_device
 
 class RLKVerlDSV4Worker(Worker):
     def load_model(self, **kwargs):
+        from rl_engine.integrations.engines.rollout.vllm.hash_table import original_hash_table_loading
         from rl_engine.integrations.engines.rollout.vllm.mi35x_moe import native_w4a16_loading
 
-        with native_w4a16_loading():
+        os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
+        with native_w4a16_loading(), original_hash_table_loading():
             super().load_model(**kwargs)
         from rl_engine.integrations.common.device_identity import hip_device_identity
         from rl_engine.integrations.engines.rollout.vllm.group_projection import (
             bind_original_group_projection,
+        )
+        from rl_engine.integrations.engines.rollout.vllm.indexer_topk_det import (
+            bind_rollout_deterministic_indexer_topk,
         )
         from rl_engine.integrations.engines.rollout.vllm.native_decode import bind_rollout_decode
         from rl_engine.integrations.engines.rollout.vllm.native_sparse import bind_rollout_sparse
@@ -38,7 +43,7 @@ class RLKVerlDSV4Worker(Worker):
             bind_output_head,
             selected_raw_logprobs,
         )
-        from rl_engine.integrations.engines.rollout.vllm.q_projection import bind_original_q_projection
+        from rl_engine.integrations.engines.rollout.vllm.routed_combine import bind_rollout_fixed_routed_combine
         from rl_engine.integrations.engines.rollout.vllm.router_projection import (
             bind_rollout_router_projection,
         )
@@ -57,29 +62,66 @@ class RLKVerlDSV4Worker(Worker):
         self._rlk_source_identity["actual_model_source"] = __import__("inspect").getfile(type(wrapper))
         self._rlk_pp_rank = get_pp_group().rank_in_group
         self._rlk_device_identity = hip_device_identity()
+        bootstrap_path = os.environ.get("RLK_PHASE_BOOTSTRAP_POLICY")
+        bootstrap = torch.load(bootstrap_path, map_location="cuda", weights_only=True) if bootstrap_path else None
+        phase_version = bootstrap["weight_version"] if bootstrap else 0
+        if type(phase_version) is not int or phase_version < 0:
+            raise ValueError("invalid phase bootstrap weight version")
         self._rlk_worker = bind_mhc_worker(
             model,
             "rollout",
             backend=os.environ.get("RLK_VERL_MHC_BACKEND", "rocm_triton"),
             mode="split",
-            version=0,
+            version=phase_version,
         )
         bind_shared_down(model, self._rlk_worker)
+        bind_rollout_fixed_routed_combine()
+        bind_rollout_deterministic_indexer_topk()
+        from rl_engine.integrations.engines.rollout.vllm.indexer_paged_logits import (
+            bind_rollout_paged_indexer_logits,
+        )
+
+        bind_rollout_paged_indexer_logits()
+        from rl_engine.backends.rocm.attention.compressor_schedule import pin_c128_compressor_schedule
+
+        pin_c128_compressor_schedule()
+        from vllm.distributed import get_tensor_model_parallel_world_size as _tp_size
+
+        tp_exact = _tp_size() > 1
+        if tp_exact:
+            from rl_engine.integrations.engines.rollout.vllm.routed_experts_tp import bind_tp_exact_routed_experts
+            from rl_engine.integrations.engines.rollout.vllm.shared_expert_tp import bind_tp_exact_shared_expert
+            from rl_engine.integrations.engines.rollout.vllm.tp_exact import (
+                assert_eager,
+                bind_exact_embedding,
+                bind_exact_moe_runner,
+                prepare_tp_collective,
+            )
+
+            assert_eager(self.vllm_config)
+            prepare_tp_collective(self.vllm_config)
+            if self._rlk_pp_rank == 0:
+                bind_exact_embedding(model.embed_tokens)
         for index in range(model.start_layer, model.end_layer):
             layer = model.layers[index]
-            from rl_engine.integrations.engines.rollout.vllm.c128_compressor import bind_single_pass_c128
             from rl_engine.integrations.engines.rollout.vllm.compressor_projection import (
                 bind_rollout_compressor_projection,
             )
-            from rl_engine.integrations.engines.rollout.vllm.fixed_combine import bind_fixed_combine
+            from rl_engine.integrations.engines.rollout.vllm.indexer_paged_logits import bind_rollout_weights_proj
+            from rl_engine.integrations.engines.rollout.vllm.q_up_projection import bind_q_up_projection
 
-            bind_fixed_combine(layer.ffn)
+            bind_q_up_projection(layer.attn)
             bind_rollout_compressor_projection(layer.attn)
-            bind_single_pass_c128(layer.attn)
+            bind_rollout_weights_proj(layer.attn)
             bind_rollout_router_projection(layer.ffn.gate)
-            bind_original_q_projection(layer.attn, self.model_config.model, index)
-            bind_rollout_sparse(layer.attn)
+            bind_rollout_sparse(
+                layer.attn, max_workspace_bytes=int(os.environ.get("RLK_VERL_SPARSE_WORKSPACE_BYTES", 1 << 30))
+            )
             bind_original_group_projection(layer.attn, self.model_config.model, index)
+            if tp_exact:
+                bind_tp_exact_shared_expert(layer.ffn, self.model_config.model, index)
+                bind_tp_exact_routed_experts(layer.ffn, self.model_config.model, index)
+                bind_exact_moe_runner(layer.ffn.experts)
             bind_rollout_decode(layer.attn)
         from rl_engine.integrations.engines.rollout.vllm.batch_order import bind_prefill_order
 
@@ -125,6 +167,72 @@ class RLKVerlDSV4Worker(Worker):
 
             logprob.compute_token_logprobs = raw
 
+        if bootstrap is not None:
+            from rl_engine.integrations.engines.rollout.vllm.checkpoint_sync import (
+                pipeline_stage_payload,
+                readback_original_tensor,
+                verify_loaded_update,
+            )
+
+            payload = pipeline_stage_payload(wrapper, bootstrap)
+            with self._rlk_worker.request(phase_version):
+                if phase_version == 0:
+                    loaded = {readback_original_tensor(wrapper, n, t)[0] for n, t in payload["weights"].items()}
+                else:
+                    # This is a newly constructed process with no admitted requests or old KV.
+                    loaded = wrapper.load_weights(payload["weights"].items())
+                checked = verify_loaded_update(wrapper, payload, loaded)
+            from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+
+            self._rlk_phase_bootstrap = dict(
+                weight_version=phase_version,
+                parameter_load_completed=True,
+                tensor_parallel_rank=get_tensor_model_parallel_rank(),
+                tensor_parallel_size=get_tensor_model_parallel_world_size(),
+                pipeline_stage=self._rlk_pp_rank,
+                pid=os.getpid(),
+                device_identity=self._rlk_device_identity,
+                original_layer_ids=list(range(model.start_layer, model.end_layer)),
+                verified_original_tensors=checked,
+                lifecycle="fresh worker; policy loaded/read back before admission; no residency claim",
+            )
+
+    def rlk_phase_bootstrap_ack(self):
+        if not hasattr(self, "_rlk_phase_bootstrap"):
+            raise RuntimeError("phase worker did not bootstrap and read back the requested policy")
+        return self._rlk_phase_bootstrap
+
+    def rlk_phase_readback_dump(self, policy_path, directory):
+        """Persist actual module tensor bytes for the independent CPU verifier."""
+        import hashlib
+        from pathlib import Path
+
+        from rl_engine.integrations.engines.rollout.vllm.checkpoint_sync import (
+            pipeline_stage_payload,
+            readback_original_tensor,
+        )
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        payload = pipeline_stage_payload(
+            self.model_runner.get_model(), torch.load(policy_path, map_location="cpu", weights_only=True)
+        )
+        if payload["weight_version"] != self._rlk_worker.version:
+            raise RuntimeError("raw readback requested a stale policy")
+        wrapper = self.model_runner.get_model()
+        actual = {}
+        with self._rlk_worker.request(self._rlk_worker.version):
+            for name, value in payload["weights"].items():
+                actual[name] = readback_original_tensor(wrapper, name, value)[2].detach().cpu().clone()
+        root = Path(directory)
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"pp{self._rlk_pp_rank}-tp{get_tensor_model_parallel_rank()}.pt"
+        if path.exists():
+            raise FileExistsError("retain previous raw readback rather than overwrite")
+        torch.save(dict(weight_version=self._rlk_worker.version, tensors=actual), path)
+        with path.open("rb") as source:
+            sha = hashlib.file_digest(source, "sha256").hexdigest()
+        return dict(self._rlk_phase_bootstrap, raw_readback_file=str(path), raw_readback_sha256=sha)
+
     def rlk_sync_weights(self, path):
         from rl_engine.integrations.engines.rollout.vllm.checkpoint_sync import (
             pipeline_stage_payload,
@@ -164,8 +272,14 @@ class RLKVerlDSV4Worker(Worker):
         )
 
     def rlk_placement(self):
+        from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+
+        tp_rank, tp = get_tensor_model_parallel_rank(), get_tensor_model_parallel_world_size()
         return dict(
-            rank=self._rlk_pp_rank,
+            rank=self._rlk_pp_rank * tp + tp_rank,
+            tensor_parallel_rank=tp_rank,
+            tensor_parallel_size=tp,
+            pipeline_stage=self._rlk_pp_rank,
             node_id=self._rlk_source_identity["node_id"],
             pid=os.getpid(),
             worker_identity=self._rlk_process_key,

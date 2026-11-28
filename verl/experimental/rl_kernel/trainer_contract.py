@@ -61,8 +61,6 @@ def validate_trainer_config(config):
         "actor_rollout_ref.actor.megatron.use_remove_padding": False,
         "actor_rollout_ref.actor.megatron.use_fused_kernels": False,
         "actor_rollout_ref.rollout.name": "vllm",
-        "actor_rollout_ref.rollout.pipeline_model_parallel_size": rollout_pp(),
-        "actor_rollout_ref.rollout.tensor_model_parallel_size": rollout_tp(),
         "actor_rollout_ref.rollout.data_parallel_size": 1,
         "actor_rollout_ref.rollout.expert_parallel_size": 1,
         "actor_rollout_ref.rollout.enforce_eager": True,
@@ -78,6 +76,14 @@ def validate_trainer_config(config):
         "actor_rollout_ref.rollout.checkpoint_engine.backend": "naive",
     }
     errors = [f"{key} must be {expected!r}" for key, expected in required.items() if value(config, key) != expected]
+    cfg_rollout_pp = value(config, "actor_rollout_ref.rollout.pipeline_model_parallel_size")
+    cfg_rollout_tp = value(config, "actor_rollout_ref.rollout.tensor_model_parallel_size")
+    if not (
+        type(cfg_rollout_pp) is int
+        and cfg_rollout_pp >= 1
+        and (cfg_rollout_tp == 1 or (cfg_rollout_pp == 1 and cfg_rollout_tp in (1, 2, 4, 8)))
+    ):
+        errors.append("rollout (PP, TP) must be (PP>=1, 1) or (1, TP in 1,2,4,8)")
     for key in (
         "actor_rollout_ref.model.mtp.enable",
         "actor_rollout_ref.model.lora.rank",

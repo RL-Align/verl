@@ -33,7 +33,7 @@ from verl.workers.engine.base import EngineRegistry
 from .trainer_contract import logical_cases
 
 
-def bind_actor_operators(model):
+def bind_actor_operators(model, *, sparse_workspace_bytes=1 << 30):
     from rl_engine.integrations.engines.train.megatron.native_combine import bind_native_combine
     from rl_engine.integrations.engines.train.megatron.native_compressor import (
         bind_native_compressor,
@@ -53,20 +53,26 @@ def bind_actor_operators(model):
     from rl_engine.integrations.engines.train.megatron.native_router_projection import (
         bind_native_router_projection,
     )
-    from rl_engine.integrations.engines.train.megatron.native_indexer import bind_native_fp8_indexer
     from rl_engine.integrations.engines.train.megatron.native_sparse import bind_native_sparse
     from rl_engine.integrations.engines.train.megatron.native_w4a16 import bind_native_w4a16
 
     for layer in model.decoder.layers[::2]:
         attention = layer.inner_layer.self_attention
-        bind_native_sparse(attention.core_attention)
+        bind_native_sparse(attention.core_attention, max_workspace_bytes=sparse_workspace_bytes)
         bind_native_inverse_rope(attention)
         if getattr(attention.core_attention, "compressor", None) is not None:
             bind_compressor_projection(attention.core_attention.compressor)
             bind_native_compressor(attention.core_attention.compressor, attention._rlk_qkv_preprocess)
         if getattr(attention.core_attention, "indexer", None) is not None:
             bind_compressor_projection(attention.core_attention.indexer.compressor)
-            bind_native_fp8_indexer(attention.core_attention, attention._rlk_qkv_preprocess)
+            from rl_engine.integrations.engines.train.megatron.native_compressor_projection import (
+                bind_indexer_weights_proj,
+            )
+
+            bind_indexer_weights_proj(attention.core_attention.indexer)
+            from rl_engine.integrations.engines.train.megatron.native_indexer import bind_production_indexer
+
+            bind_production_indexer(attention.core_attention, attention._rlk_qkv_preprocess)
     for layer in model.decoder.layers[1::2]:
         mlp = layer.inner_layer.mlp
         bind_native_router_projection(mlp.router)
@@ -81,6 +87,8 @@ class RLKVerlMcoreEngineConfig(RLKNativeMcoreEngineConfig):
     strategy: str = "rlk_verl_megatron"
     rlk_allow_right_padding: bool = True
     rlk_evidence_dir: str = ""
+    rlk_require_update_forward_parity: bool = False
+    rlk_sparse_workspace_bytes: int = 1 << 30
 
     def __post_init__(self):
         if self.strategy != "rlk_verl_megatron":
@@ -97,15 +105,16 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
     def initialize(self):
         super().initialize()
         for model in self._rlk_models:
-            bind_actor_operators(model)
+            bind_actor_operators(model, sparse_workspace_bytes=self.engine_config.rlk_sparse_workspace_bytes)
         from examples.operators.dsv4_4l.distributed_evidence import PipelineBoundaryEvidence
 
-        self._rlk_boundary = PipelineBoundaryEvidence(self._rlk_models[0], dp_rank=0)
+        self._rlk_boundary = PipelineBoundaryEvidence(self._rlk_models[0], dp_rank=self.get_data_parallel_rank())
         self._rlk_previous_optimizer = None
         if self.engine_config.rlk_evidence_dir:
             import os
 
             import torch.distributed as dist
+            from megatron.core import parallel_state as mpu
             from rl_engine.integrations.common.device_identity import hip_device_identity
 
             root = Path(self.engine_config.rlk_evidence_dir)
@@ -114,6 +123,8 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
                 json.dumps(
                     dict(
                         rank=dist.get_rank(),
+                        dp_rank=self.get_data_parallel_rank(),
+                        ep_rank=mpu.get_expert_model_parallel_rank(),
                         actual_model_class=type(self._rlk_models[0]).__module__
                         + "."
                         + type(self._rlk_models[0]).__qualname__,
@@ -182,6 +193,29 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
         calls = []
 
         def observed_loss(*args, **kwargs):
+            update_parity = None
+            if self.engine_config.rlk_require_update_forward_parity:
+                from verl.workers.utils.padding import no_padding_2_padding
+                from .trainer_contract import strict_response_parity
+
+                bound = inspect.signature(loss_function).bind(*args, **kwargs).arguments
+                model_output, batch = bound["model_output"], bound["data"]
+                current = no_padding_2_padding(model_output["log_probs"], batch)
+                original = batch.select("old_log_probs", "response_mask").to_padded_tensor()
+                if not self.engine_config.rlk_evidence_dir:
+                    raise RuntimeError("strict update-forward checking requires retained raw evidence")
+                torch.save(
+                    dict(
+                        current=current.detach().cpu(),
+                        old=original["old_log_probs"].detach().cpu(),
+                        response_mask=original["response_mask"].detach().cpu(),
+                        weight_version=self.rlk_weight_version,
+                        input_token_rows=[row.detach().cpu().tolist() for row in batch["input_ids"].unbind()],
+                    ),
+                    Path(self.engine_config.rlk_evidence_dir)
+                    / f"update-forward-rank{dist.get_rank()}-v{self.rlk_weight_version + 1}-micro{len(calls)}.pt",
+                )
+                update_parity = strict_response_parity(current, original["old_log_probs"], original["response_mask"])
             result = loss_function(*args, **kwargs)
             loss = result[0]
             calls.append(
@@ -191,6 +225,7 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
                     value=float(loss.detach()),
                     finite=bool(torch.isfinite(loss)),
                     requires_grad=loss.requires_grad,
+                    update_forward_parity=update_parity,
                 )
             )
             return result
@@ -257,10 +292,16 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
                 gradient_records[name] = tensor_record(gradient)
         finite = all(bool(torch.isfinite(gradient).all()) for gradient in gradients)
         finite = finite and all(row["finite"] for rows in self._rlk_autograd_receipts.values() for row in rows)
+        local_received = {name for name, rows in self._rlk_autograd_receipts.items() if rows}
+        if self.get_data_parallel_size() > 1:
+            # A parameter may be used only by another replica's data; the DP-reduced gradient is nonzero everywhere.
+            gathered = [None] * self.get_data_parallel_size()
+            dist.all_gather_object(gathered, sorted(local_received), group=self.get_data_parallel_group())
+            received_anywhere = set().union(*gathered)
+        else:
+            received_anywhere = local_received
         missing_effective = [
-            name
-            for name, record in gradient_records.items()
-            if record["nonzero"] and not self._rlk_autograd_receipts.get(name)
+            name for name, record in gradient_records.items() if record["nonzero"] and name not in received_anywhere
         ]
         if missing_effective:
             raise RuntimeError(f"effective optimizer gradients lack actual autograd receipt: {missing_effective}")
@@ -289,6 +330,7 @@ class RLKVerlMegatronEngine(RLKNativeMegatronEngine):
                     dict(
                         weight_version=self.rlk_weight_version,
                         rank=dist.get_rank(),
+                        dp_rank=self.get_data_parallel_rank(),
                         optimizer_before=optimizer_before,
                         optimizer_after=optimizer_after,
                         optimizer_continuity=True,
